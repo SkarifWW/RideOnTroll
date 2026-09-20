@@ -10,7 +10,6 @@ namespace TrollBuildingMod
     {
         public static Character TargetTroll = null;
         public static TrollPiecesContainer TargetContainer = null;
-        public static Piece HoveredPiece = null;
     }
 
     public static class TrollBuildConstants
@@ -34,28 +33,77 @@ namespace TrollBuildingMod
     public class TrollBoneFollower : MonoBehaviour
     {
         public Transform TargetBone;
-        public Vector3 LocalOffset = new Vector3(0f, 0.4f, -0.2f);
+        public Vector3 LocalOffset = new Vector3(0f, 0.4f, -0.25f);
 
-        private Rigidbody m_rb;
+        private Vector3 m_previousPosition;
+        private Quaternion m_previousRotation;
 
-        private void Awake()
+        private void Start()
         {
-            m_rb = GetComponent<Rigidbody>();
-            if (m_rb == null) m_rb = gameObject.AddComponent<Rigidbody>();
-            m_rb.isKinematic = true;
-            m_rb.useGravity = false;
-            m_rb.interpolation = RigidbodyInterpolation.Interpolate;
+            if (TargetBone != null)
+            {
+                transform.position = TargetBone.TransformPoint(LocalOffset);
+                transform.rotation = TargetBone.rotation;
+            }
+            m_previousPosition = transform.position;
+            m_previousRotation = transform.rotation;
         }
 
+        // Физическая синхронизация игрока с платформой в момент шага физики
         private void FixedUpdate()
         {
             if (TargetBone == null) return;
 
-            Vector3 targetPos = TargetBone.TransformPoint(LocalOffset);
-            Quaternion targetRot = TargetBone.rotation;
+            Vector3 newPos = TargetBone.TransformPoint(LocalOffset);
+            Quaternion newRot = TargetBone.rotation;
 
-            m_rb.MovePosition(targetPos);
-            m_rb.MoveRotation(targetRot);
+            Player player = Player.m_localPlayer;
+            if (player != null && !player.IsDead())
+            {
+                Collider groundCol = player.GetLastGroundCollider();
+                if (groundCol != null)
+                {
+                    TrollPieceTag tag = groundCol.GetComponentInParent<TrollPieceTag>();
+                    if (tag != null && tag.Container != null && tag.Container.PlatformAnchor == transform)
+                    {
+                        // 1. Дельта линейного перемещения кости
+                        Vector3 deltaPos = newPos - m_previousPosition;
+
+                        // 2. Дельта вращения вокруг центра платформы (учет центробежного смещения)
+                        Quaternion deltaRot = newRot * Quaternion.Inverse(m_previousRotation);
+                        Vector3 playerOffset = player.transform.position - m_previousPosition;
+                        Vector3 rotatedOffset = deltaRot * playerOffset;
+
+                        Vector3 totalPlayerShift = (m_previousPosition + rotatedOffset + deltaPos) - player.transform.position;
+
+                        // Перемещаем игрока синхронно с платформой
+                        player.transform.position += totalPlayerShift;
+
+                        Rigidbody playerRb = player.GetComponent<Rigidbody>();
+                        if (playerRb != null)
+                        {
+                            playerRb.position += totalPlayerShift;
+                        }
+                    }
+                }
+            }
+
+            transform.position = newPos;
+            transform.rotation = newRot;
+            transform.localScale = Vector3.one;
+
+            m_previousPosition = newPos;
+            m_previousRotation = newRot;
+
+            // Принудительно актуализируем матрицы коллайдеров построек в PhysX
+            Physics.SyncTransforms();
+        }
+
+        private void LateUpdate()
+        {
+            if (TargetBone == null) return;
+            transform.position = TargetBone.TransformPoint(LocalOffset);
+            transform.rotation = TargetBone.rotation;
         }
     }
 
@@ -87,13 +135,6 @@ namespace TrollBuildingMod
 
             TrollCharacter = GetComponent<Character>();
 
-            // Синхронизируем аниматор с физикой (устраняет рассинхрон костей и коллизий)
-            Animator anim = GetComponentInChildren<Animator>();
-            if (anim != null)
-            {
-                anim.updateMode = AnimatorUpdateMode.Fixed;
-            }
-
             SetupPlatformAnchor();
             CacheTrollColliders();
             InitUUID();
@@ -112,8 +153,8 @@ namespace TrollBuildingMod
             Transform targetBone = FindSpineBone();
 
             GameObject anchorObj = new GameObject("_TrollPlatformRootAnchor");
-            anchorObj.transform.position = targetBone.position;
-            anchorObj.transform.rotation = targetBone.rotation;
+            anchorObj.transform.SetParent(transform, false);
+            anchorObj.transform.localScale = Vector3.one;
 
             Follower = anchorObj.AddComponent<TrollBoneFollower>();
             Follower.TargetBone = targetBone;
@@ -179,6 +220,22 @@ namespace TrollBuildingMod
         {
             if (PlatformAnchor == null) SetupPlatformAnchor();
 
+            // Создаем страховочный утолщенный пол-ловушку (Catch Floor) толщиной 1.5м
+            Transform catchFloor = PlatformAnchor.Find("_TrollCatchFloor");
+            if (catchFloor == null)
+            {
+                GameObject catchObj = new GameObject("_TrollCatchFloor");
+                catchObj.transform.SetParent(PlatformAnchor, false);
+                catchObj.transform.localPosition = new Vector3(0f, -0.75f, 0f);
+                catchObj.layer = LayerMask.NameToLayer("piece");
+
+                BoxCollider box = catchObj.AddComponent<BoxCollider>();
+                box.size = new Vector3(5f, 1.5f, 5f);
+
+                TrollPieceTag tag = catchObj.AddComponent<TrollPieceTag>();
+                tag.Container = this;
+            }
+
             Transform snapRoot = PlatformAnchor.Find("_TrollSnapGrid");
             if (snapRoot != null)
             {
@@ -201,7 +258,7 @@ namespace TrollBuildingMod
                     GameObject snap = new GameObject("snappoint");
                     snap.tag = "snappoint";
                     snap.transform.SetParent(gridObj.transform, false);
-                    snap.transform.localPosition = new Vector3(x, 0.1f, z);
+                    snap.transform.localPosition = new Vector3(x, 0f, z);
                     PlatformSnapPoints.Add(snap.transform);
                 }
             }
@@ -217,10 +274,13 @@ namespace TrollBuildingMod
                 m_attachedPieces.Add(pieceView);
             }
 
-            // Для кинематического Rigidbody все MeshCollider обязаны быть convex
+            // Обеспечиваем выпуклость MeshCollider для точного просчета коллизий в динамике
             foreach (var mc in pieceView.GetComponentsInChildren<MeshCollider>(true))
             {
-                if (!mc.convex) mc.convex = true;
+                if (!mc.convex)
+                {
+                    mc.convex = true;
+                }
             }
 
             pieceView.transform.SetParent(PlatformAnchor);
@@ -293,7 +353,6 @@ namespace TrollBuildingMod
             }
         }
 
-        // ЗАЩИТА ОТ КАТАПУЛЬТЫ: тело тролля не должно выталкивать стоящего игрока
         public void IgnoreCollisionsWithPlayer(Collider playerCol)
         {
             if (!playerCol) return;
@@ -335,11 +394,6 @@ namespace TrollBuildingMod
         {
             TrollRegistry.UnregisterTroll(TrollUUID);
 
-            if (PlatformAnchor != null)
-            {
-                Destroy(PlatformAnchor.gameObject);
-            }
-
             if (ZNetScene.instance == null || ZNet.instance == null) return;
 
             if (TrollCharacter != null && TrollCharacter.IsDead())
@@ -348,7 +402,6 @@ namespace TrollBuildingMod
                 return;
             }
 
-            // НЕ ДЕЛАЕМ SetParent(null), чтобы постройки не зависали в воздухе при выгрузке зоны
             SyncZDOPositions();
         }
 
@@ -516,12 +569,6 @@ namespace TrollBuildingMod
     [HarmonyPatch]
     public static class TrollBuildingPatches
     {
-        private static readonly AccessTools.FieldRef<Character, Vector3> MoveDirRef =
-            AccessTools.FieldRefAccess<Character, Vector3>("m_moveDir");
-
-        private static readonly AccessTools.FieldRef<Player, int> ManualSnapPointRef =
-            AccessTools.FieldRefAccess<Player, int>("m_manualSnapPoint");
-
         private static readonly AccessTools.FieldRef<Player, GameObject> PlacementGhostRef =
             AccessTools.FieldRefAccess<Player, GameObject>("m_placementGhost");
 
@@ -533,17 +580,6 @@ namespace TrollBuildingMod
 
         private static readonly AccessTools.FieldRef<Player, Player.PlacementStatus> PlacementStatusRef =
             AccessTools.FieldRefAccess<Player, Player.PlacementStatus>("m_placementStatus");
-
-        private static readonly AccessTools.FieldRef<Player, GameObject> PlacementMarkerInstanceRef =
-            AccessTools.FieldRefAccess<Player, GameObject>("m_placementMarkerInstance");
-
-        private static Vector3 s_lockedLocalPos = Vector3.zero;
-        private static Quaternion s_lockedLocalRot = Quaternion.identity;
-        private static Character s_lastTroll = null;
-        private static string s_lastGhostPrefabName = "";
-        private static int s_lastPlaceRot = -1;
-        private static int s_lastSnapIndex = -2;
-        private static bool s_hasLockedPosition = false;
 
         private struct GhostOriginalFlags
         {
@@ -582,16 +618,11 @@ namespace TrollBuildingMod
             }
         }
 
-        // РАСЧЕТ ПОВОРОТА: если наведены на деталь, наследуем её 3D-наклон во все стороны
         public static Quaternion GetGhostRotation(float x, float y, float z)
         {
             Quaternion localEuler = Quaternion.Euler(x, y, z);
             if (TrollBuildContext.TargetContainer != null && TrollBuildContext.TargetContainer.PlatformAnchor != null)
             {
-                if (TrollBuildContext.HoveredPiece != null)
-                {
-                    return TrollBuildContext.HoveredPiece.transform.rotation * localEuler;
-                }
                 return TrollBuildContext.TargetContainer.PlatformAnchor.rotation * localEuler;
             }
             return localEuler;
@@ -636,7 +667,6 @@ namespace TrollBuildingMod
             waterSurface = null;
             TrollBuildContext.TargetTroll = null;
             TrollBuildContext.TargetContainer = null;
-            TrollBuildContext.HoveredPiece = null;
 
             if (GameCamera.instance == null)
             {
@@ -679,10 +709,8 @@ namespace TrollBuildingMod
                         heightmap = null;
                         TrollBuildContext.TargetTroll = troll;
                         TrollBuildContext.TargetContainer = container;
-                        TrollBuildContext.HoveredPiece = piece;
 
-                        // Честная нормаль коллизии позволяет корректно ставить стены, крыши и балки
-                        normal = hit.normal;
+                        normal = container.PlatformAnchor != null ? container.PlatformAnchor.up : Vector3.up;
 
                         __result = true;
                         return false;
@@ -755,45 +783,8 @@ namespace TrollBuildingMod
             TrollPiecesContainer container = TrollBuildContext.TargetContainer;
             if (troll == null || container == null || ghost == null)
             {
-                s_hasLockedPosition = false;
-                s_lastTroll = null;
                 return;
             }
-
-            Transform anchor = container.PlatformAnchor;
-            if (anchor == null) return;
-
-            if (!ghost.activeInHierarchy) ghost.SetActive(true);
-
-            int placeRotation = PlaceRotationRef != null ? PlaceRotationRef(__instance) : 0;
-            Vector2 mouseDelta = ZInput.GetMouseDelta();
-            bool hasMouseInput = mouseDelta.sqrMagnitude > 0.0001f;
-            bool hasJoyInput = Mathf.Abs(ZInput.GetJoyRightStickX()) > 0.05f || Mathf.Abs(ZInput.GetJoyRightStickY()) > 0.05f;
-            bool hasMoveInput = MoveDirRef != null && MoveDirRef(__instance).sqrMagnitude > 0.001f;
-            bool rotChanged = (placeRotation != s_lastPlaceRot);
-
-            int currentSnapIndex = ManualSnapPointRef != null ? ManualSnapPointRef(__instance) : -1;
-            bool snapChanged = (currentSnapIndex != s_lastSnapIndex);
-            bool contextChanged = (s_lastTroll != troll || s_lastGhostPrefabName != ghost.name);
-
-            bool playerActivelyAiming = hasMouseInput || hasJoyInput || hasMoveInput || rotChanged || snapChanged || contextChanged || !s_hasLockedPosition;
-
-            if (playerActivelyAiming)
-            {
-                // Запоминаем локальное положение и честный 3D-поворот относительно опоры
-                s_lockedLocalPos = anchor.InverseTransformPoint(ghost.transform.position);
-                s_lockedLocalRot = Quaternion.Inverse(anchor.rotation) * ghost.transform.rotation;
-
-                s_lastPlaceRot = placeRotation;
-                s_lastSnapIndex = currentSnapIndex;
-                s_lastTroll = troll;
-                s_lastGhostPrefabName = ghost.name;
-                s_hasLockedPosition = true;
-            }
-
-            // Плавное следование за костью без скольжения при движении тролля
-            ghost.transform.position = anchor.TransformPoint(s_lockedLocalPos);
-            ghost.transform.rotation = anchor.rotation * s_lockedLocalRot;
 
             if (PlacementStatusRef != null)
             {
@@ -862,10 +853,8 @@ namespace TrollBuildingMod
                 }
             }
 
-            s_hasLockedPosition = false;
             TrollBuildContext.TargetTroll = null;
             TrollBuildContext.TargetContainer = null;
-            TrollBuildContext.HoveredPiece = null;
         }
 
         [HarmonyPatch(typeof(WearNTear), "UpdateSupport")]
@@ -917,10 +906,8 @@ namespace TrollBuildingMod
             }
         }
 
-        // ПЛАВНАЯ ФИЗИКА ИГРОКА: перехватываем ApplyGroundForce, как это делает Valheim для кораблей
-        private static Vector3 s_playerAnchorLocalPos = Vector3.zero;
-        private static TrollPiecesContainer s_lastPlayerContainer = null;
-
+        // Физический перенос игрока происходит в TrollBoneFollower.FixedUpdate.
+        // Здесь мы просто возвращаем false, отменяя стандартное ванильное трение земли.
         [HarmonyPatch(typeof(Character), "ApplyGroundForce")]
         [HarmonyPrefix]
         private static bool ApplyGroundForce_Prefix(Character __instance, ref Vector3 vel, Vector3 targetVel)
@@ -932,37 +919,6 @@ namespace TrollBuildingMod
 
             TrollPieceTag pieceTag = groundCollider.GetComponentInParent<TrollPieceTag>();
             if (pieceTag == null || pieceTag.Container == null) return true;
-
-            TrollPiecesContainer container = pieceTag.Container;
-            Transform anchor = container.PlatformAnchor;
-            if (anchor == null) return true;
-
-            Rigidbody anchorRb = anchor.GetComponent<Rigidbody>();
-            if (anchorRb == null) return true;
-
-            // Передаем полную скорость платформы (включая Y, чтобы игрок не проваливался при шагах)
-            Vector3 pointVelocity = anchorRb.GetPointVelocity(__instance.transform.position);
-            vel += pointVelocity;
-
-            // Когда игрок стоит на месте, компенсируем погрешность смещения мягкой пружиной (как в Ship)
-            if (targetVel.sqrMagnitude < 0.001f)
-            {
-                if (s_lastPlayerContainer == container)
-                {
-                    Vector3 targetWorld = anchor.TransformPoint(s_playerAnchorLocalPos);
-                    Vector3 delta = targetWorld - __instance.transform.position;
-                    vel += delta * 10f;
-                }
-                else
-                {
-                    s_lastPlayerContainer = container;
-                }
-                s_playerAnchorLocalPos = anchor.InverseTransformPoint(__instance.transform.position);
-            }
-            else
-            {
-                s_lastPlayerContainer = null;
-            }
 
             return false;
         }

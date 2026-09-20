@@ -10,7 +10,7 @@ namespace TrollTamerMod
     {
         public const string PluginGUID = "com.custom.trolltamer";
         public const string PluginName = "TrollTamer";
-        public const string PluginVersion = "1.2.0";
+        public const string PluginVersion = "1.3.2";
 
         private Harmony _harmony;
 
@@ -18,12 +18,124 @@ namespace TrollTamerMod
         {
             _harmony = new Harmony(PluginGUID);
             _harmony.PatchAll();
-            Logger.LogInfo("TrollTamer Mod loaded successfully.");
+            Logger.LogInfo("TrollTamer Mod (Режим полной заморозки) загружен успешно.");
         }
 
         private void OnDestroy()
         {
             _harmony?.UnpatchSelf();
+        }
+    }
+
+    /// <summary>
+    /// Контроллер полной остановки тролля.
+    /// Отключает физику, AI и замораживает скелет/анимации в текущей позе.
+    /// </summary>
+    public class TrollFreezeController : MonoBehaviour
+    {
+        private Character _character;
+        private ZNetView _nview;
+        private Rigidbody _body;
+        private ZSyncAnimation _zanim;
+        private Animator[] _animators;
+
+        private Vector3 _lockedPosition;
+        private Quaternion _lockedRotation;
+        private bool _isCurrentlyFrozen = false;
+
+        private void Awake()
+        {
+            _character = GetComponent<Character>();
+            _nview = GetComponent<ZNetView>();
+            _body = GetComponent<Rigidbody>();
+            _zanim = GetComponent<ZSyncAnimation>();
+            _animators = GetComponentsInChildren<Animator>(true);
+        }
+
+        private void Start()
+        {
+            // Обновляем список аниматоров после полной инициализации префаба
+            _animators = GetComponentsInChildren<Animator>(true);
+        }
+
+        private void FixedUpdate()
+        {
+            if (_nview == null || !_nview.IsValid()) return;
+
+            bool shouldBeFrozen = _character.IsTamed() && _nview.GetZDO().GetBool(TrollTamePatches.ZDO_FREEZE_KEY, false);
+
+            if (shouldBeFrozen)
+            {
+                if (!_isCurrentlyFrozen)
+                {
+                    _isCurrentlyFrozen = true;
+                    _lockedPosition = transform.position;
+                    _lockedRotation = transform.rotation;
+
+                    if (_body != null)
+                    {
+                        // Обнуляем скорость СТРОГО ДО включения isKinematic!
+                        _body.linearVelocity = Vector3.zero;
+                        _body.angularVelocity = Vector3.zero;
+                        _body.isKinematic = true;
+                    }
+                }
+
+                // Гарантированно выключаем анимации, чтобы кости скелета застыли
+                if (_zanim != null && _zanim.enabled)
+                {
+                    _zanim.enabled = false;
+                }
+
+                if (_animators != null)
+                {
+                    for (int i = 0; i < _animators.Length; i++)
+                    {
+                        if (_animators[i] != null && _animators[i].enabled)
+                        {
+                            _animators[i].enabled = false;
+                        }
+                    }
+                }
+
+                // Намертво фиксируем положение и поворот в пространстве
+                transform.position = _lockedPosition;
+                transform.rotation = _lockedRotation;
+
+                // ВНИМАНИЕ: Не трогаем _body.linearVelocity пока _body.isKinematic == true,
+                // иначе Unity спамит в консоль предупреждениями.
+            }
+            else
+            {
+                if (_isCurrentlyFrozen)
+                {
+                    _isCurrentlyFrozen = false;
+
+                    if (_body != null)
+                    {
+                        _body.isKinematic = false;
+                        _body.linearVelocity = Vector3.zero;
+                        _body.angularVelocity = Vector3.zero;
+                    }
+
+                    // Включаем анимацию обратно
+                    if (_zanim != null && !_zanim.enabled)
+                    {
+                        _zanim.enabled = true;
+                    }
+
+                    if (_animators != null)
+                    {
+                        for (int i = 0; i < _animators.Length; i++)
+                        {
+                            if (_animators[i] != null && !_animators[i].enabled)
+                            {
+                                _animators[i].enabled = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -104,9 +216,18 @@ namespace TrollTamerMod
     [HarmonyPatch]
     public static class TrollTamePatches
     {
+        public const string ZDO_FREEZE_KEY = "TrollBuild_IsFrozen";
+
         public static bool IsTroll(Character character)
         {
             return character != null && character.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static bool IsFrozenTroll(Character character)
+        {
+            if (!IsTroll(character) || !character.IsTamed()) return false;
+            ZNetView nv = character.GetComponent<ZNetView>();
+            return nv != null && nv.IsValid() && nv.GetZDO().GetBool(ZDO_FREEZE_KEY, false);
         }
 
         [HarmonyPatch(typeof(ZNetScene), "Awake")]
@@ -121,23 +242,24 @@ namespace TrollTamerMod
                 GameObject prefab = __instance.GetPrefab(name);
                 if (prefab != null)
                 {
-                    SetupTrollTameable(prefab);
+                    SetupTrollComponents(prefab);
                 }
             }
         }
 
-        public static void SetupTrollTameable(GameObject go)
+        public static void SetupTrollComponents(GameObject go)
         {
-            Tameable tame = go.GetComponent<Tameable>();
-            if (tame == null)
-            {
-                tame = go.AddComponent<Tameable>();
-            }
+            Tameable tame = go.GetComponent<Tameable>() ?? go.AddComponent<Tameable>();
             tame.m_commandable = true;
             tame.m_nameBeforeText = true;
             tame.m_tameText = "$hud_tamelove";
             tame.m_fedDuration = 1800f;
             tame.m_tamingTime = 60f;
+
+            if (go.GetComponent<TrollFreezeController>() == null)
+            {
+                go.AddComponent<TrollFreezeController>();
+            }
         }
 
         [HarmonyPatch(typeof(Character), "Awake")]
@@ -146,11 +268,36 @@ namespace TrollTamerMod
         {
             if (IsTroll(__instance))
             {
-                SetupTrollTameable(__instance.gameObject);
+                SetupTrollComponents(__instance.gameObject);
             }
         }
 
-        // ПЕРЕХВАТ ВЗАИМОДЕЙСТВИЯ: Позволяет клавише "E" корректно отдавать команды Tameable
+        // БЛОКИРУЕМ стандартную физику персонажа Valheim (предотвращает спам логов кинематики и смещение тела)
+        [HarmonyPatch(typeof(Character), "CustomFixedUpdate")]
+        [HarmonyPrefix]
+        public static bool Character_CustomFixedUpdate_Prefix(Character __instance)
+        {
+            if (IsFrozenTroll(__instance))
+            {
+                return false; // Полностью отключаем UpdateBody, гравитацию и физические расчеты
+            }
+            return true;
+        }
+
+        // БЛОКИРУЕМ логику поведения ИИ, когда тролль заморожен
+        [HarmonyPatch(typeof(MonsterAI), "UpdateAI")]
+        [HarmonyPrefix]
+        public static bool MonsterAI_UpdateAI_Prefix(MonsterAI __instance)
+        {
+            Character c = __instance.GetComponent<Character>();
+            if (IsFrozenTroll(c))
+            {
+                __instance.StopMoving();
+                return false;
+            }
+            return true;
+        }
+
         [HarmonyPatch(typeof(Player), "Interact")]
         [HarmonyPrefix]
         public static bool Player_Interact_Prefix(Player __instance, GameObject go, bool hold, bool alt)
@@ -165,9 +312,9 @@ namespace TrollTamerMod
                 {
                     if (tameable.Interact(__instance, hold, alt))
                     {
-                        AccessTools.Method(typeof(Humanoid), "DoInteractAnimation").Invoke(__instance, new object[] { character.gameObject });
+                        AccessTools.Method(typeof(Humanoid), "DoInteractAnimation")?.Invoke(__instance, new object[] { character.gameObject });
                     }
-                    return false; // Отменяем стандартную обработку
+                    return false;
                 }
             }
             return true;
@@ -183,6 +330,17 @@ namespace TrollTamerMod
                 if (tame != null)
                 {
                     __result = tame.GetHoverText();
+                }
+
+                ZNetView nv = __instance.GetComponent<ZNetView>();
+                if (nv != null && nv.IsValid())
+                {
+                    bool isFrozen = nv.GetZDO().GetBool(ZDO_FREEZE_KEY, false);
+                    string stateText = isFrozen
+                        ? "<color=#55FF55>ВКЛ</color>"
+                        : "<color=#FF5555>ВЫКЛ</color>";
+
+                    __result += $"\n[<color=yellow><b>Зажать $KEY_Use</b></color>] Не двигайся: {stateText}";
                 }
             }
         }
@@ -245,6 +403,58 @@ namespace TrollTamerMod
                     (attacker as Player)?.Message(MessageHud.MessageType.TopLeft, "Тролль разъярен полученным ударом! Приручение сорвано навсегда.", 0, null, false);
                 }
             }
+        }
+    }
+
+    [HarmonyPatch(typeof(Player), "Update")]
+    public static class Player_HoldE_TrollFreeze_Patch
+    {
+        private static float _holdTimer = 0f;
+        private static bool _holdExecuted = false;
+        private const float HOLD_REQUIRED_TIME = 0.6f;
+
+        [HarmonyPostfix]
+        public static void Postfix(Player __instance)
+        {
+            if (__instance != Player.m_localPlayer) return;
+
+            if (!ZInput.GetButton("Use") && !ZInput.GetButton("JoyUse"))
+            {
+                _holdTimer = 0f;
+                _holdExecuted = false;
+                return;
+            }
+
+            GameObject hoverObj = __instance.GetHoverObject();
+            if (hoverObj == null) return;
+
+            Character character = hoverObj.GetComponentInParent<Character>();
+            if (character == null || !TrollTamePatches.IsTroll(character) || !character.IsTamed()) return;
+
+            ZNetView nview = character.GetComponent<ZNetView>();
+            if (nview == null || !nview.IsValid()) return;
+
+            _holdTimer += Time.deltaTime;
+            if (_holdTimer >= HOLD_REQUIRED_TIME && !_holdExecuted)
+            {
+                _holdExecuted = true;
+                ToggleFreeze(character, nview);
+            }
+        }
+
+        private static void ToggleFreeze(Character character, ZNetView nview)
+        {
+            bool currentState = nview.GetZDO().GetBool(TrollTamePatches.ZDO_FREEZE_KEY, false);
+            bool newState = !currentState;
+
+            nview.ClaimOwnership();
+            nview.GetZDO().Set(TrollTamePatches.ZDO_FREEZE_KEY, newState);
+
+            string message = newState
+                ? "Режим неподвижности: ВКЛЮЧЕН"
+                : "Режим неподвижности: ВЫКЛЮЧЕН";
+
+            MessageHud.instance?.ShowMessage(MessageHud.MessageType.Center, message);
         }
     }
 }
