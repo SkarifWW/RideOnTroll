@@ -1,0 +1,1256 @@
+﻿using HarmonyLib;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TrollTamerMod;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.UI;
+using GUIFramework;
+using UnityEngine.EventSystems;
+
+namespace TrollBuildingMod
+{
+    #region Константы / локализация / иконки
+
+    public static class TrollWalkConstants
+    {
+        public const string KeyActive = "TrollWalk_Active";
+        public const string KeyTarget = "TrollWalk_Target";
+        public const string KeyName = "TrollWalk_Name";
+        public const string KeyLastPos = "TrollWalk_LastPos";
+        public const string KeyLastUpdate = "TrollWalk_LastUpdate";
+        public const string KeySpeed = "TrollWalk_Speed";
+
+        public static readonly int HashActive = KeyActive.GetStableHashCode();
+        public static readonly int HashTarget = KeyTarget.GetStableHashCode();
+        public static readonly int HashName = KeyName.GetStableHashCode();
+        public static readonly int HashLastPos = KeyLastPos.GetStableHashCode();
+        public static readonly int HashLastUpdate = KeyLastUpdate.GetStableHashCode();
+        public static readonly int HashSpeed = KeySpeed.GetStableHashCode();
+
+        public const float ArriveRadius = 3f;
+        public const float RunDistance = 15f;
+        public const float DefaultSpeed = 3.5f;
+        public const float TelemetryInterval = 2f;
+        public const float VirtualStepInterval = 2f;
+        public const float ThrashInterval = 2.2f;
+        public const float ThrashCancelAfterSeconds = 0f;
+
+        public static readonly string[] TrollPrefabNames = { "Troll", "Troll_Log" };
+
+        public static bool IsDedicatedServer => SystemInfo.graphicsDeviceType == GraphicsDeviceType.Null;
+    }
+
+    public static class TrollWalkLoc
+    {
+        public static string T(string en, string ru)
+        {
+            string lang = Localization.instance != null
+                ? Localization.instance.GetSelectedLanguage()
+                : PlayerPrefs.GetString("language", "English");
+            return (lang != null && lang.IndexOf("Russian", StringComparison.OrdinalIgnoreCase) >= 0) ? ru : en;
+        }
+    }
+
+    public static class TrollWalkIcons
+    {
+        public static Sprite Road;
+        public static Sprite Troll;
+        private static bool s_loaded;
+
+        public static void EnsureLoaded()
+        {
+            if (s_loaded || TrollWalkConstants.IsDedicatedServer) return;
+            s_loaded = true;
+            Road = Load("road.png", new Color32(230, 160, 40, 255));
+            Troll = Load("troll.png", new Color32(90, 170, 90, 255));
+        }
+
+        private static Sprite Load(string file, Color32 fallbackColor)
+        {
+            Sprite s = LoadFromDisk(file);
+            if (s != null) return s;
+
+            s = LoadFromResources(file);
+            if (s != null) return s;
+
+            Debug.LogWarning($"[TrollWalk] Icon '{file}' not found on disk or in resources. Using fallback.");
+            Texture2D t = new Texture2D(32, 32, TextureFormat.RGBA32, false);
+            Color32[] px = new Color32[32 * 32];
+            for (int i = 0; i < px.Length; i++) px[i] = fallbackColor;
+            t.SetPixels32(px);
+            t.Apply();
+            return Sprite.Create(t, new Rect(0, 0, 32, 32), new Vector2(0.5f, 0.5f), 100f);
+        }
+
+        private static Sprite LoadFromDisk(string file)
+        {
+            try
+            {
+                string asmDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
+                string[] paths =
+                {
+                    Path.Combine(asmDir, "icon", file),
+                    Path.Combine(asmDir, file),
+                    Path.Combine(Directory.GetCurrentDirectory(), "icon", file)
+                };
+                foreach (string path in paths)
+                {
+                    if (!File.Exists(path)) continue;
+                    Texture2D tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                    if (tex.LoadImage(File.ReadAllBytes(path)))
+                    {
+                        Debug.Log($"[TrollWalk] Icon '{file}' loaded from disk: {path}");
+                        return PostProcess(tex);
+                    }
+                }
+            }
+            catch (Exception e) { Debug.LogWarning($"[TrollWalk] Disk icon load {file}: {e.Message}"); }
+            return null;
+        }
+
+        // Внедрённые ресурсы сборки (Build Action = Embedded Resource)
+        private static Sprite LoadFromResources(string file)
+        {
+            try
+            {
+                Assembly asm = Assembly.GetExecutingAssembly();
+                string[] names = asm.GetManifestResourceNames();
+                foreach (string res in names)
+                {
+                    if (!res.EndsWith(file, StringComparison.OrdinalIgnoreCase)) continue;
+                    using (Stream stream = asm.GetManifestResourceStream(res))
+                    {
+                        if (stream == null) continue;
+                        byte[] bytes = new byte[stream.Length];
+                        stream.Read(bytes, 0, bytes.Length);
+                        Texture2D tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                        if (tex.LoadImage(bytes))
+                        {
+                            Debug.Log($"[TrollWalk] Icon '{file}' loaded from embedded resource '{res}'");
+                            return PostProcess(tex);
+                        }
+                    }
+                }
+                if (names.Length > 0)
+                    Debug.LogWarning($"[TrollWalk] '{file}' not among {names.Length} resources. Sample: {string.Join(", ", names.Take(6).ToArray())}");
+                else
+                    Debug.LogWarning("[TrollWalk] Assembly has NO embedded resources. Check csproj: <EmbeddedResource Include=\"icon\\" + file + "\" />");
+            }
+            catch (Exception e) { Debug.LogWarning($"[TrollWalk] Resource icon load {file}: {e.Message}"); }
+            return null;
+        }
+
+        // Пост-обработка как в AegisDome
+        private static Sprite PostProcess(Texture2D tex)
+        {
+            tex.wrapMode = TextureWrapMode.Clamp;
+            tex.filterMode = FilterMode.Bilinear;
+
+            try
+            {
+                Color32[] pixels = tex.GetPixels32();
+                bool dirty = false;
+                for (int i = 0; i < pixels.Length; i++)
+                {
+                    if (pixels[i].a > 0 && pixels[i].a < 15)
+                    {
+                        pixels[i] = new Color32(0, 0, 0, 0);
+                        dirty = true;
+                    }
+                }
+                if (dirty) { tex.SetPixels32(pixels); tex.Apply(false); }
+            }
+            catch { }
+
+            return Sprite.Create(tex, new Rect(0, 0, tex.width, tex.height),
+                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect);
+        }
+    }
+
+    #endregion
+
+    #region Контроллер тролля
+
+    public class TrollWalkController : MonoBehaviour
+    {
+        private Character m_character;
+        private ZNetView m_nview;
+        private MonsterAI m_ai;
+
+        private static readonly MethodInfo s_moveTo = AccessTools.Method(typeof(BaseAI), "MoveTo");
+
+        private float m_telemetryTimer;
+        private Vector3 m_telLastPos;
+        private float m_thrashTimer;
+        private float m_shoveTimer;
+        private Vector3 m_shoveDir;
+        private Vector3 m_stuckCheckPos;
+        private float m_stuckCheckTimer;
+        private float m_stuckAccum;
+        private float m_noPathTimer;
+        private float m_thrashTotal;
+
+        private void Awake()
+        {
+            m_character = GetComponent<Character>();
+            m_nview = GetComponent<ZNetView>();
+            m_ai = GetComponent<MonsterAI>();
+            m_stuckCheckPos = transform.position;
+            m_telLastPos = transform.position;
+            if (m_character != null)
+            {
+                try { m_character.m_onDeath = (Action)Delegate.Combine(m_character.m_onDeath, new Action(OnDeath)); }
+                catch { }
+            }
+        }
+
+        private void Start()
+        {
+            try { CatchUpOnLoad(); } catch { }
+        }
+
+        private void CatchUpOnLoad()
+        {
+            if (m_nview == null || !m_nview.IsValid()) return;
+            ZDO zdo = m_nview.GetZDO();
+            if (zdo == null || !zdo.GetBool(TrollWalkConstants.HashActive, false)) return;
+
+            if (!zdo.HasOwner()) zdo.SetOwner(ZDOMan.GetSessionID());
+            if (!zdo.IsOwner()) return;
+
+            long tick = zdo.GetLong(TrollWalkConstants.HashLastUpdate, 0L);
+            double elapsed = tick > 0 ? Math.Max(0.0, (ZNet.instance.GetTime() - new DateTime(tick)).TotalSeconds) : 0;
+            if (elapsed < 8.0) return;
+
+            Vector3 lastPos = zdo.GetVec3(TrollWalkConstants.HashLastPos, transform.position);
+            Vector3 target = zdo.GetVec3(TrollWalkConstants.HashTarget, lastPos);
+            float dist = Utils.DistanceXZ(target, lastPos);
+            float speed = Mathf.Max(0.5f, zdo.GetFloat(TrollWalkConstants.HashSpeed, TrollWalkConstants.DefaultSpeed));
+            float travel = Mathf.Min(speed * (float)elapsed, dist);
+
+            if (dist - travel <= TrollWalkConstants.ArriveRadius)
+            {
+                zdo.Set(TrollWalkConstants.HashActive, false);
+                return;
+            }
+            if (dist > 0.01f)
+            {
+                Vector3 dir = new Vector3((target.x - lastPos.x) / dist, 0f, (target.z - lastPos.z) / dist);
+                Vector3 est = lastPos + dir * travel;
+                if (Utils.DistanceXZ(transform.position, est) > 8f)
+                    transform.position = new Vector3(est.x, transform.position.y, est.z);
+            }
+        }
+
+        public void TickAI(float dt)
+        {
+            if (m_nview == null || !m_nview.IsValid() || !m_nview.IsOwner()) return;
+            if (m_character == null || m_character.IsDead() || m_ai == null) return;
+            if (s_moveTo == null) return;
+
+            ZDO zdo = m_nview.GetZDO();
+            if (zdo == null || !zdo.GetBool(TrollWalkConstants.HashActive, false)) return;
+            if (TrollTamePatches.IsFrozenTroll(m_character)) return;
+
+            if (m_ai.GetTargetCreature() != null || m_ai.GetStaticTarget() != null)
+            {
+                m_noPathTimer = 0f; m_stuckAccum = 0f;
+                return;
+            }
+            if (m_character.InAttack() || m_character.IsStaggering()) return;
+
+            if (m_shoveTimer > 0f)
+            {
+                m_shoveTimer -= dt;
+                m_character.SetMoveDir(m_shoveDir);
+                m_character.SetRun(false);
+                return;
+            }
+
+            Vector3 target = zdo.GetVec3(TrollWalkConstants.HashTarget, transform.position);
+            float dist = Utils.DistanceXZ(target, transform.position);
+            bool run = dist > TrollWalkConstants.RunDistance;
+
+            bool arrived = (bool)s_moveTo.Invoke(m_ai,
+                new object[] { dt, target, TrollWalkConstants.ArriveRadius, run });
+
+            if (arrived)
+            {
+                if (dist <= TrollWalkConstants.ArriveRadius + 0.5f)
+                {
+                    FinishRoute(zdo);
+                    return;
+                }
+                m_noPathTimer += dt;
+            }
+            else
+            {
+                m_noPathTimer = 0f;
+            }
+
+            UpdateStuck(dt);
+
+            m_thrashTimer -= dt;
+            bool stuck = m_noPathTimer > 1f || m_stuckAccum >= 4f;
+            if (stuck && m_thrashTimer <= 0f)
+            {
+                m_thrashTimer = TrollWalkConstants.ThrashInterval;
+                m_noPathTimer = 0f;
+                m_stuckAccum = 0f;
+                m_thrashTotal += TrollWalkConstants.ThrashInterval;
+
+                if (TrollWalkConstants.ThrashCancelAfterSeconds > 0f &&
+                    m_thrashTotal > TrollWalkConstants.ThrashCancelAfterSeconds)
+                {
+                    FinishRoute(zdo, cancelled: true);
+                    return;
+                }
+
+                m_character.StartAttack(null, false);
+                Vector2 r = UnityEngine.Random.insideUnitCircle;
+                if (r.sqrMagnitude < 0.01f) r = Vector2.right;
+                r.Normalize();
+                m_shoveDir = new Vector3(r.x, 0f, r.y);
+                m_shoveTimer = 0.6f;
+            }
+        }
+
+        private void UpdateStuck(float dt)
+        {
+            m_stuckCheckTimer -= dt;
+            if (m_stuckCheckTimer > 0f) return;
+            m_stuckCheckTimer = 0.5f;
+            float moved = Utils.DistanceXZ(transform.position, m_stuckCheckPos);
+            m_stuckCheckPos = transform.position;
+            if (moved < 0.2f) m_stuckAccum += 0.5f;
+            else m_stuckAccum = 0f;
+        }
+
+        private void FinishRoute(ZDO zdo, bool cancelled = false)
+        {
+            if (!zdo.IsOwner()) zdo.SetOwner(ZDOMan.GetSessionID());
+            zdo.Set(TrollWalkConstants.HashActive, false);
+
+            Player p = Player.m_localPlayer;
+            if (p != null && Utils.DistanceXZ(p.transform.position, transform.position) < 60f)
+            {
+                string name = zdo.GetString(TrollWalkConstants.HashName, "");
+                p.Message(MessageHud.MessageType.Center, cancelled
+                    ? TrollWalkLoc.T($"{name} could not get through, route cancelled", $"{name} не смог пройти — путь отменён")
+                    : TrollWalkLoc.T($"{name} has arrived", $"{name} прибыл в точку назначения"), 0, null, false);
+            }
+            TrollWalkManager.Instance?.UpdatePins();
+        }
+
+        private void OnDeath()
+        {
+            try
+            {
+                if (m_nview != null && m_nview.IsValid())
+                {
+                    ZDO zdo = m_nview.GetZDO();
+                    if (zdo != null)
+                    {
+                        if (!zdo.IsOwner()) zdo.SetOwner(ZDOMan.GetSessionID());
+                        zdo.Set(TrollWalkConstants.HashActive, false);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void FixedUpdate()
+        {
+            try { Telemetry(); } catch { }
+        }
+
+        private void Telemetry()
+        {
+            if (m_nview == null || !m_nview.IsValid() || !m_nview.IsOwner()) return;
+            ZDO zdo = m_nview.GetZDO();
+            if (zdo == null || !zdo.GetBool(TrollWalkConstants.HashActive, false)) return;
+
+            m_telemetryTimer += Time.fixedDeltaTime;
+            if (m_telemetryTimer < TrollWalkConstants.TelemetryInterval) return;
+
+            float d = Utils.DistanceXZ(transform.position, m_telLastPos);
+            float inst = d / Mathf.Max(0.1f, m_telemetryTimer);
+            float prev = zdo.GetFloat(TrollWalkConstants.HashSpeed, TrollWalkConstants.DefaultSpeed);
+            float speed = Mathf.Clamp(Mathf.Lerp(prev, inst, 0.5f), 0.5f, 8f);
+
+            zdo.Set(TrollWalkConstants.HashLastPos, transform.position);
+            zdo.Set(TrollWalkConstants.HashLastUpdate, ZNet.instance.GetTime().Ticks);
+            zdo.Set(TrollWalkConstants.HashSpeed, speed);
+
+            m_telemetryTimer = 0f;
+            m_telLastPos = transform.position;
+
+            TrollWalkManager.Instance?.NotifyActive(zdo.m_uid);
+        }
+    }
+
+    #endregion
+
+    #region Менеджер: маршруты, пины, виртуальный ходок
+
+    public class TrollWalkManager : MonoBehaviour
+    {
+        public static TrollWalkManager Instance;
+        internal static bool s_internalRemove;
+
+        internal class RouteInfo
+        {
+            public ZDOID Troll;
+            public Minimap.PinData RoutePin;
+            public Minimap.PinData TrackerPin;
+        }
+
+        private readonly Dictionary<ZDOID, RouteInfo> s_routes = new Dictionary<ZDOID, RouteInfo>();
+        internal List<ZDOID> ActiveRouteIds
+        {
+            get
+            {
+                List<ZDOID> list = new List<ZDOID>(s_routes.Count);
+                foreach (KeyValuePair<ZDOID, RouteInfo> kv in s_routes)
+                {
+                    ZDO z = ZDOMan.instance != null ? ZDOMan.instance.GetZDO(kv.Key) : null;
+                    if (z != null && z.GetBool(TrollWalkConstants.HashActive, false)) list.Add(kv.Key);
+                }
+                return list;
+            }
+        }
+
+        private float m_virtualTimer;
+        private int m_scanPrefab;
+        private int m_scanIndex;
+        private readonly List<ZDO> m_scanBuf = new List<ZDO>();
+        private bool m_scanProcessing;
+        private static float s_lastHint = -10f;
+
+        private static readonly MethodInfo s_addPin = AccessTools.Method(typeof(Minimap), "AddPin");
+        private static readonly MethodInfo s_removePin = AccessTools.Method(typeof(Minimap), "RemovePin",
+            new[] { typeof(Minimap.PinData) });
+        private static readonly AccessTools.FieldRef<Minimap, List<Minimap.PinData>> s_pinsField =
+            AccessTools.FieldRefAccess<Minimap, List<Minimap.PinData>>("m_pins");
+        private static readonly AccessTools.FieldRef<Minimap, bool> s_pinUpdateField =
+            AccessTools.FieldRefAccess<Minimap, bool>("m_pinUpdateRequired");
+        private static object s_puidDefault;
+
+        private void Awake() { Instance = this; }
+        private void OnDestroy() { if (Instance == this) Instance = null; }
+
+        public static void EnsureCreated()
+        {
+            if (Instance != null) return;
+            GameObject go = new GameObject("TrollWalkManager");
+            DontDestroyOnLoad(go);
+            go.AddComponent<TrollWalkManager>();
+            Debug.Log("[TrollWalk] Manager created");
+        }
+
+        private void Update()
+        {
+            if (ZNetScene.instance == null || ZNet.instance == null || ZDOMan.instance == null)
+            {
+                HardReset();
+                return;
+            }
+
+            if (ZNet.instance.IsServer())
+            {
+                m_virtualTimer += Time.deltaTime;
+                if (m_virtualTimer >= TrollWalkConstants.VirtualStepInterval)
+                {
+                    m_virtualTimer = 0f;
+                    try { VirtualStep(); } catch { }
+                }
+            }
+            BackgroundScan();
+        }
+
+        private void HardReset()
+        {
+            if (s_routes.Count == 0 && !TrollWalkRouteSession.Active) return;
+            Minimap mm = Minimap.instance;
+            foreach (RouteInfo ri in s_routes.Values) RemoveRoutePins(mm, ri);
+            s_routes.Clear();
+            TrollWalkRouteSession.HardReset();
+        }
+
+        private void VirtualStep()
+        {
+            List<ZDOID> ids = s_routes.Keys.ToList();
+            foreach (ZDOID id in ids)
+            {
+                ZDO zdo = ZDOMan.instance.GetZDO(id);
+                if (zdo == null || !zdo.GetBool(TrollWalkConstants.HashActive, false)) continue;
+
+                long owner = zdo.GetOwner();
+                if (owner != 0L && owner != ZDOMan.GetSessionID() && ZNet.instance.GetPeer(owner) != null)
+                    continue;
+
+                if (ZNetScene.instance != null && ZNetScene.instance.FindInstance(zdo) != null)
+                    continue;
+
+                if (owner != ZDOMan.GetSessionID()) zdo.SetOwner(ZDOMan.GetSessionID());
+
+                long tick = zdo.GetLong(TrollWalkConstants.HashLastUpdate, 0L);
+                if (tick == 0L) { zdo.Set(TrollWalkConstants.HashLastUpdate, ZNet.instance.GetTime().Ticks); continue; }
+                double elapsed = (ZNet.instance.GetTime() - new DateTime(tick)).TotalSeconds;
+                if (elapsed <= 0.0) continue;
+
+                Vector3 lastPos = zdo.GetVec3(TrollWalkConstants.HashLastPos, zdo.GetPosition());
+                Vector3 target = zdo.GetVec3(TrollWalkConstants.HashTarget, lastPos);
+                float dist = Utils.DistanceXZ(target, lastPos);
+                float speed = Mathf.Max(0.5f, zdo.GetFloat(TrollWalkConstants.HashSpeed, TrollWalkConstants.DefaultSpeed));
+                float travel = Mathf.Min(speed * (float)elapsed, dist);
+
+                if (dist - travel <= TrollWalkConstants.ArriveRadius)
+                {
+                    Vector3 fin = new Vector3(target.x, lastPos.y, target.z);
+                    zdo.Set(TrollWalkConstants.HashActive, false);
+                    zdo.SetPosition(fin);
+                    zdo.Set(TrollWalkConstants.HashLastPos, fin);
+                    zdo.Set(TrollWalkConstants.HashLastUpdate, ZNet.instance.GetTime().Ticks);
+                }
+                else if (dist > 0.01f)
+                {
+                    Vector3 dir = new Vector3((target.x - lastPos.x) / dist, 0f, (target.z - lastPos.z) / dist);
+                    Vector3 newPos = lastPos + dir * travel;
+                    zdo.SetPosition(newPos);
+                    zdo.Set(TrollWalkConstants.HashLastPos, newPos);
+                    zdo.Set(TrollWalkConstants.HashLastUpdate, ZNet.instance.GetTime().Ticks);
+                }
+            }
+        }
+
+        private void BackgroundScan()
+        {
+            if (m_scanProcessing)
+            {
+                ProcessScan();
+                return;
+            }
+            if (m_scanPrefab >= TrollWalkConstants.TrollPrefabNames.Length) return;
+
+            bool done = ZDOMan.instance.GetAllZDOsWithPrefabIterative(
+                TrollWalkConstants.TrollPrefabNames[m_scanPrefab], m_scanBuf, ref m_scanIndex);
+            if (done)
+            {
+                m_scanPrefab++;
+                m_scanIndex = 0;
+                if (m_scanPrefab >= TrollWalkConstants.TrollPrefabNames.Length)
+                    m_scanProcessing = true;
+            }
+        }
+
+        private void ProcessScan()
+        {
+            m_scanProcessing = false;
+            foreach (ZDO zdo in m_scanBuf)
+            {
+                if (zdo == null || !zdo.GetBool(TrollWalkConstants.HashActive, false)) continue;
+                NotifyActive(zdo.m_uid);
+            }
+            m_scanBuf.Clear();
+            m_scanPrefab = 0;
+            m_scanIndex = 0;
+        }
+
+        internal void NotifyActive(ZDOID id)
+        {
+            if (id == ZDOID.None || s_routes.ContainsKey(id)) return;
+            s_routes[id] = new RouteInfo { Troll = id };
+        }
+
+        public void Dispatch(ZDOID trollId, Vector3 target, string name)
+        {
+            if (ZDOMan.instance == null) return;
+            ZDO zdo = ZDOMan.instance.GetZDO(trollId);
+            if (zdo == null) return;
+
+            // не отправляем мёртвого
+            ZNetView inst = ZNetScene.instance != null ? ZNetScene.instance.FindInstance(zdo) : null;
+            if (inst != null)
+            {
+                Character c = inst.GetComponent<Character>();
+                if (c != null && c.IsDead())
+                {
+                    Player.m_localPlayer?.Message(MessageHud.MessageType.Center,
+                        TrollWalkLoc.T("The troll is dead", "Тролль мёртв"), 0, null, false);
+                    return;
+                }
+            }
+
+            zdo.SetOwner(ZDOMan.GetSessionID());
+
+            if (zdo.GetBool(TrollTamePatches.ZDO_FREEZE_KEY, false))
+            {
+                zdo.Set(TrollTamePatches.ZDO_FREEZE_KEY, false);
+                Player.m_localPlayer?.Message(MessageHud.MessageType.Center,
+                    TrollWalkLoc.T("Freeze removed — troll is ready to go", "Заморозка снята — тролль готов в путь"), 0, null, false);
+            }
+
+            zdo.Set(TrollWalkConstants.HashActive, true);
+            zdo.Set(TrollWalkConstants.HashTarget, target);
+            zdo.Set(TrollWalkConstants.HashName, name);
+            zdo.Set(TrollWalkConstants.HashLastPos, zdo.GetPosition());
+            zdo.Set(TrollWalkConstants.HashLastUpdate, ZNet.instance.GetTime().Ticks);
+            if (zdo.GetFloat(TrollWalkConstants.HashSpeed, 0f) <= 0.1f)
+                zdo.Set(TrollWalkConstants.HashSpeed, TrollWalkConstants.DefaultSpeed);
+
+            NotifyActive(trollId);
+            UpdatePins();
+
+            Player.m_localPlayer?.Message(MessageHud.MessageType.Center,
+                TrollWalkLoc.T($"{name}: on the way", $"{name}: тролль отправлен в путь"), 0, null, false);
+            Debug.Log($"[TrollWalk] Dispatch troll {trollId} -> {target} '{name}'");
+        }
+
+        public void CancelRoute(ZDOID trollId, bool notify)
+        {
+            if (ZDOMan.instance == null) return;
+            ZDO zdo = ZDOMan.instance.GetZDO(trollId);
+            if (zdo != null)
+            {
+                if (!zdo.IsOwner()) zdo.SetOwner(ZDOMan.GetSessionID());
+                zdo.Set(TrollWalkConstants.HashActive, false);
+            }
+            if (s_routes.TryGetValue(trollId, out RouteInfo ri))
+            {
+                RemoveRoutePins(Minimap.instance, ri);
+                s_routes.Remove(trollId);
+            }
+            if (notify)
+                Player.m_localPlayer?.Message(MessageHud.MessageType.Center,
+                    TrollWalkLoc.T("Route cancelled", "Путь отменён"), 0, null, false);
+            UpdatePins();
+        }
+
+        internal ZDOID FindTrollByPin(Minimap.PinData pin)
+        {
+            foreach (KeyValuePair<ZDOID, RouteInfo> kv in s_routes)
+            {
+                if (kv.Value.RoutePin == pin || kv.Value.TrackerPin == pin) return kv.Key;
+            }
+            return ZDOID.None;
+        }
+
+        public void UpdatePins()
+        {
+            if (TrollWalkConstants.IsDedicatedServer) return;
+            Minimap mm = Minimap.instance;
+            if (mm == null || ZDOMan.instance == null) return;
+            TrollWalkIcons.EnsureLoaded();
+
+            bool visible = TrollWalkRouteSession.PinsVisible;
+            bool changed = false;
+            List<ZDOID> drop = null;
+
+            foreach (KeyValuePair<ZDOID, RouteInfo> kv in s_routes.ToList())
+            {
+                ZDO zdo = ZDOMan.instance.GetZDO(kv.Key);
+                if (zdo == null || !zdo.GetBool(TrollWalkConstants.HashActive, false))
+                {
+                    RemoveRoutePins(mm, kv.Value);
+                    (drop ??= new List<ZDOID>()).Add(kv.Key);
+                    changed = true;
+                    continue;
+                }
+
+                RouteInfo ri = kv.Value;
+
+                // ПКМ-фильтр по кнопке пина пути: скрываем/показываем пины маршрута
+                if (!visible)
+                {
+                    if (ri.RoutePin != null || ri.TrackerPin != null)
+                    {
+                        RemoveRoutePins(mm, ri);
+                        changed = true;
+                    }
+                    continue;
+                }
+
+                string name = zdo.GetString(TrollWalkConstants.HashName, "");
+                Vector3 target = zdo.GetVec3(TrollWalkConstants.HashTarget, Vector3.zero);
+                Vector3 pos = EstimatePosition(zdo);
+
+                if (ri.RoutePin == null)
+                {
+                    ri.RoutePin = AddPinSafe(mm, target, name, TrollWalkIcons.Road);
+                    changed = true;
+                }
+                else
+                {
+                    if ((ri.RoutePin.m_pos - target).sqrMagnitude > 0.01f) { ri.RoutePin.m_pos = target; changed = true; }
+                    if (ri.RoutePin.m_name != name) { ri.RoutePin.m_name = name; changed = true; }
+                }
+
+                if (ri.TrackerPin == null)
+                {
+                    ri.TrackerPin = AddPinSafe(mm, pos, name, TrollWalkIcons.Troll);
+                    changed = true;
+                }
+                else if ((ri.TrackerPin.m_pos - pos).sqrMagnitude > 0.04f)
+                {
+                    ri.TrackerPin.m_pos = pos;
+                    changed = true;
+                }
+                if (ri.TrackerPin.m_name != name) { ri.TrackerPin.m_name = name; changed = true; }
+            }
+
+            if (drop != null)
+                foreach (ZDOID d in drop) s_routes.Remove(d);
+
+            if (changed) SetPinUpdateRequired(mm, true);
+        }
+
+        internal Vector3 EstimatePosition(ZDO zdo)
+        {
+            ZNetView inst = ZNetScene.instance != null ? ZNetScene.instance.FindInstance(zdo) : null;
+            if (inst != null) return inst.transform.position;
+
+            Vector3 lastPos = zdo.GetVec3(TrollWalkConstants.HashLastPos, zdo.GetPosition());
+            Vector3 target = zdo.GetVec3(TrollWalkConstants.HashTarget, lastPos);
+            long tick = zdo.GetLong(TrollWalkConstants.HashLastUpdate, 0L);
+            double elapsed = tick > 0 ? Math.Max(0.0, (ZNet.instance.GetTime() - new DateTime(tick)).TotalSeconds) : 0;
+            float dist = Utils.DistanceXZ(target, lastPos);
+            if (dist < 0.01f) return lastPos;
+            float speed = Mathf.Max(0.5f, zdo.GetFloat(TrollWalkConstants.HashSpeed, TrollWalkConstants.DefaultSpeed));
+            float travel = Mathf.Min(speed * (float)elapsed, dist);
+            Vector3 dir = new Vector3((target.x - lastPos.x) / dist, 0f, (target.z - lastPos.z) / dist);
+            return lastPos + dir * travel;
+        }
+
+        private void RemoveRoutePins(Minimap mm, RouteInfo ri)
+        {
+            if (mm == null) { ri.RoutePin = null; ri.TrackerPin = null; return; }
+            if (ri.RoutePin != null) RemovePinInternal(mm, ri.RoutePin);
+            if (ri.TrackerPin != null) RemovePinInternal(mm, ri.TrackerPin);
+            ri.RoutePin = null;
+            ri.TrackerPin = null;
+            SetPinUpdateRequired(mm, true);
+        }
+
+        internal static Minimap.PinData AddPinSafe(Minimap mm, Vector3 pos, string name, Sprite icon)
+        {
+            if (s_addPin == null || mm == null) return null;
+            try
+            {
+                if (s_puidDefault == null)
+                {
+                    ParameterInfo last = s_addPin.GetParameters().Last();
+                    s_puidDefault = last.ParameterType.IsValueType
+                        ? Activator.CreateInstance(last.ParameterType) : null;
+                }
+                Minimap.PinData pin = s_addPin.Invoke(mm,
+                    new object[] { pos, Minimap.PinType.None, name, false, false, 0L, s_puidDefault }) as Minimap.PinData;
+                if (pin != null)
+                {
+                    pin.m_icon = icon;
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        try { pin.m_NamePinData = new Minimap.PinNameData(pin); } catch { }
+                    }
+                }
+                return pin;
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[TrollWalk] AddPin failed: {e.Message}");
+                return null;
+            }
+        }
+
+        internal static void RemovePinInternal(Minimap mm, Minimap.PinData pin)
+        {
+            if (mm == null || pin == null || s_removePin == null) return;
+            s_internalRemove = true;
+            try { s_removePin.Invoke(mm, new object[] { pin }); }
+            finally { s_internalRemove = false; }
+        }
+
+        internal static void SetPinUpdateRequired(Minimap mm, bool value)
+        {
+            try { if (mm != null && s_pinUpdateField != null) s_pinUpdateField(mm) = value; } catch { }
+        }
+
+        internal static bool IsOurPin(Minimap.PinData pin)
+        {
+            return pin != null &&
+                   (pin.m_icon == TrollWalkIcons.Road || pin.m_icon == TrollWalkIcons.Troll);
+        }
+
+        internal static Minimap.PinData FindClosestOurPin(Minimap mm, Vector3 pos, float radius)
+        {
+            if (mm == null || s_pinsField == null) return null;
+            List<Minimap.PinData> pins = s_pinsField(mm);
+            if (pins == null) return null;
+            Minimap.PinData best = null;
+            float bestDist = radius;
+            foreach (Minimap.PinData pin in pins)
+            {
+                if (!IsOurPin(pin)) continue;
+                float d = Utils.DistanceXZ(pin.m_pos, pos);
+                if (d <= bestDist) { bestDist = d; best = pin; }
+            }
+            return best;
+        }
+
+        internal static void HintBlocked()
+        {
+            if (Time.time - s_lastHint < 3f) return;
+            s_lastHint = Time.time;
+            Player.m_localPlayer?.Message(MessageHud.MessageType.TopLeft,
+                TrollWalkLoc.T("Troll routes are managed via [Y] on the troll", "Путями тролля управляют через [Y] у тролля"), 0, null, false);
+        }
+
+        internal static bool HandleOurPinRemoval(Minimap mm, Minimap.PinData pin)
+        {
+            if (pin == TrollWalkRouteSession.StagingPin)
+            {
+                if (TrollWalkRouteSession.Active) TrollWalkRouteSession.RemoveStaging(mm);
+                return false;
+            }
+            if (TrollWalkRouteSession.Active)
+            {
+                ZDOID troll = Instance != null ? Instance.FindTrollByPin(pin) : ZDOID.None;
+                if (troll != ZDOID.None && Instance != null) Instance.CancelRoute(troll, true);
+                return false;
+            }
+            HintBlocked();
+            return false;
+        }
+    }
+
+    #endregion
+
+    #region Сессия маршрута (Y → карта → пин пути → закрытие карты)
+
+    public static class TrollWalkRouteSession
+    {
+        public static bool Active;
+        public static bool IconSelected;
+        public static ZDOID Troll = ZDOID.None;
+        public static Minimap.PinData StagingPin;
+        public static bool PinsVisible = true; // ПКМ по кнопке пина пути
+
+        private static GameObject s_button;
+        private static Image s_buttonIcon;
+        private static readonly Color SelectedTint = new Color(1f, 0.85f, 0.3f);
+
+        private static readonly AccessTools.FieldRef<Minimap, Image> s_icon0 =
+            AccessTools.FieldRefAccess<Minimap, Image>("m_selectedIcon0");
+        private static readonly AccessTools.FieldRef<Minimap, Image> s_icon1 =
+            AccessTools.FieldRefAccess<Minimap, Image>("m_selectedIcon1");
+
+        internal static bool s_selectGuard;
+        private static readonly MethodInfo s_selectIconMethod =
+            AccessTools.Method(typeof(Minimap), "SelectIcon");
+
+        // ============ Начало сессии: карта открывается СРАЗУ ============
+
+        public static void Begin(ZDOID troll)
+        {
+            Active = true;
+            IconSelected = false;
+            Troll = troll;
+            StagingPin = null;
+
+            TrollWalkIcons.EnsureLoaded();
+            BuildToolbarButton();
+            SetIconSelected(true); // авто-выбор пина пути (+ SelectIcon(Icon0) под ваниль)
+
+            Minimap mm = Minimap.instance;
+            if (mm != null) mm.SetMapMode(Minimap.MapMode.Large);
+
+            Player.m_localPlayer?.Message(MessageHud.MessageType.TopLeft,
+                TrollWalkLoc.T("Click the map to place the route pin, then close the map to send the troll",
+                    "Кликните по карте, чтобы поставить пин пути, затем закройте карту — тролль отправится"), 0, null, false);
+            Debug.Log($"[TrollWalk] Route session begin: troll={troll}");
+        }
+
+        public static void SetIconSelected(bool on)
+        {
+            IconSelected = on;
+            if (s_buttonIcon != null)
+                s_buttonIcon.color = on ? SelectedTint : Color.white;
+
+            if (on)
+            {
+                // гарантируем «размещаемый» ванильный тип, иначе клик по карте
+                // не дойдёт до ShowPinNameInput
+                Minimap mm = Minimap.instance;
+                if (mm != null && s_selectIconMethod != null)
+                {
+                    s_selectGuard = true;
+                    try { s_selectIconMethod.Invoke(mm, new object[] { Minimap.PinType.Icon0 }); }
+                    finally { s_selectGuard = false; }
+                }
+            }
+        }
+
+        public static void TogglePinsVisible()
+        {
+            PinsVisible = !PinsVisible;
+            TrollWalkManager.Instance?.UpdatePins();
+            Player.m_localPlayer?.Message(MessageHud.MessageType.TopLeft,
+                PinsVisible
+                    ? TrollWalkLoc.T("Troll route pins: shown", "Пины маршрутов троллей: показаны")
+                    : TrollWalkLoc.T("Troll route pins: hidden", "Пины маршрутов троллей: скрыты"), 0, null, false);
+        }
+
+        public static void RemoveStaging(Minimap mm)
+        {
+            if (StagingPin == null) return;
+            TrollWalkManager.RemovePinInternal(mm, StagingPin);
+            StagingPin = null;
+            TrollWalkManager.SetPinUpdateRequired(mm, true);
+        }
+
+        // Выход с карты = применение (ОБЯЗАТЕЛЬНЫЙ выход)
+        public static void CommitAndClose()
+        {
+            Minimap mm = Minimap.instance;
+            try
+            {
+                if (mm != null && StagingPin != null && Troll != ZDOID.None && TrollWalkManager.Instance != null)
+                {
+                    string name = StagingPin.m_name;
+                    if (string.IsNullOrEmpty(name))
+                        name = TrollWalkLoc.T("Route", "Путь");
+                    TrollWalkManager.Instance.Dispatch(Troll, StagingPin.m_pos, name);
+                }
+            }
+            finally
+            {
+                if (mm != null) RemoveStaging(mm);
+                Active = false;
+                IconSelected = false;
+                Troll = ZDOID.None;
+                DestroyToolbarButton();
+            }
+        }
+
+        public static void HardReset()
+        {
+            Minimap mm = Minimap.instance;
+            if (mm != null) RemoveStaging(mm);
+            Active = false;
+            IconSelected = false;
+            Troll = ZDOID.None;
+            DestroyToolbarButton();
+        }
+
+        // ============ Кнопка "пин пути" в меню иконок (клон ванильной иконки) ============
+
+        private static void BuildToolbarButton()
+        {
+            try
+            {
+                Minimap mm = Minimap.instance;
+                if (mm == null) return;
+                Image src = s_icon0 != null ? s_icon0(mm) : null;
+                if (src == null) return;
+
+                GameObject go = UnityEngine.Object.Instantiate(src.gameObject, src.transform.parent);
+                go.name = "TrollWalkRouteIcon";
+
+                // убираем ванильную интерактивность клона
+                foreach (Button b in go.GetComponents<Button>()) UnityEngine.Object.DestroyImmediate(b);
+                foreach (UIInputHandler uh in go.GetComponents<UIInputHandler>()) UnityEngine.Object.DestroyImmediate(uh);
+
+                // ищем, где на клонах живёт сама иконка (корень или ребёнок с тем же спрайтом)
+                Image target = go.GetComponent<Image>();
+                foreach (Image c in go.GetComponentsInChildren<Image>(true))
+                {
+                    if (c != target && c.sprite == src.sprite) { target = c; break; }
+                }
+                target.sprite = TrollWalkIcons.Road;
+                target.color = Color.white;
+
+                // позиция: справа от самой правой иконки (или порядок в layout-группе)
+                RectTransform srcRt = src.transform as RectTransform;
+                RectTransform rt = go.transform as RectTransform;
+                Vector2 spacing = new Vector2(45f, 0f);
+                Image icon1 = s_icon1 != null ? s_icon1(mm) : null;
+                if (icon1 != null)
+                {
+                    Vector2 d = (icon1.transform as RectTransform).anchoredPosition - srcRt.anchoredPosition;
+                    if (d.sqrMagnitude > 1f) spacing = d;
+                }
+                RectTransform parentRt = src.transform.parent as RectTransform;
+                if (parentRt != null)
+                {
+                    float maxX = float.MinValue;
+                    foreach (RectTransform child in parentRt)
+                        if (child != rt) maxX = Mathf.Max(maxX, child.anchoredPosition.x);
+                    if (maxX > float.MinValue)
+                        rt.anchoredPosition = new Vector2(maxX + Mathf.Abs(spacing.x), srcRt.anchoredPosition.y);
+                }
+                rt.SetAsLastSibling();
+
+                // своя интерактивность: ЛКМ — выбор, ПКМ — видимость пинов маршрутов
+                UIInputHandler handler = go.AddComponent<UIInputHandler>();
+                handler.m_onLeftDown += OnToolbarDown;
+                handler.m_onRightClick += OnToolbarRight;
+
+                s_button = go;
+                s_buttonIcon = target;
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[TrollWalk] Toolbar button failed: {e.Message}");
+            }
+        }
+
+        private static void OnToolbarDown(UIInputHandler h)
+        {
+            SetIconSelected(!IconSelected);
+            Player.m_localPlayer?.Message(MessageHud.MessageType.TopLeft,
+                IconSelected
+                    ? TrollWalkLoc.T("Route pin selected — click the map", "Пин пути выбран — кликните по карте")
+                    : TrollWalkLoc.T("Route pin deselected", "Пин пути снят с выбора"), 0, null, false);
+        }
+
+        private static void OnToolbarRight(UIInputHandler h)
+        {
+            TogglePinsVisible();
+        }
+
+        private static void DestroyToolbarButton()
+        {
+            if (s_button != null) UnityEngine.Object.Destroy(s_button);
+            s_button = null;
+            s_buttonIcon = null;
+        }
+    }
+
+    #endregion
+
+    #region Harmony-патчи
+
+    [HarmonyPatch]
+    public static class TrollWalkPatches
+    {
+        private static bool IsTroll(Character c) =>
+            c != null && c.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase);
+
+        private static readonly AccessTools.FieldRef<Minimap, Minimap.PinData> s_namePinRef =
+            AccessTools.FieldRefAccess<Minimap, Minimap.PinData>("m_namePin");
+        private static readonly AccessTools.FieldRef<Minimap, bool> s_wasFocusedRef =
+            AccessTools.FieldRefAccess<Minimap, bool>("m_wasFocused");
+        private static readonly AccessTools.FieldRef<Minimap, GuiInputField> s_nameInputRef =
+            AccessTools.FieldRefAccess<Minimap, GuiInputField>("m_nameInput");
+
+        [HarmonyPatch(typeof(Character), "Awake")]
+        [HarmonyPostfix]
+        private static void Character_Awake_Postfix(Character __instance)
+        {
+            if (__instance == null || !IsTroll(__instance)) return;
+            if (__instance.GetComponent<TrollWalkController>() == null)
+                __instance.gameObject.AddComponent<TrollWalkController>();
+        }
+
+        [HarmonyPatch(typeof(MonsterAI), "UpdateAI")]
+        [HarmonyPostfix]
+        private static void MonsterAI_UpdateAI_Postfix(MonsterAI __instance, float dt)
+        {
+            if (__instance == null) return;
+            TrollWalkController ctrl = __instance.GetComponent<TrollWalkController>();
+            if (ctrl != null) ctrl.TickAI(dt);
+        }
+
+        // ============ Ховер: через Tameable (запекается в строку, которую
+        // пишет TrollTamePatches — порядок патчей не важен) ============
+
+        [HarmonyPatch(typeof(Tameable), "GetHoverText")]
+        [HarmonyPostfix]
+        private static void Tameable_GetHoverText_Postfix(Tameable __instance, ref string __result)
+        {
+            if (__instance == null) return;
+            Character c = __instance.GetComponent<Character>();
+            if (c == null || !IsTroll(c) || !c.IsTamed() || c.IsDead()) return;
+            ZNetView nv = __instance.GetComponent<ZNetView>();
+            if (nv == null || !nv.IsValid() || nv.GetZDO() == null) return;
+            ZDO zdo = nv.GetZDO();
+
+            if (zdo.GetBool(TrollWalkConstants.HashActive, false))
+            {
+                string rn = zdo.GetString(TrollWalkConstants.HashName, "");
+                __result += $"\n<color=#aaccff>{TrollWalkLoc.T("On the way:", "В пути:")} {rn}</color>";
+            }
+            __result += $"\n[<color=yellow><b>Y</b></color>] {TrollWalkLoc.T("Send to waypoint (map)", "Отправить (карта)")}";
+        }
+
+        // Тролль «принимает имя пути» до конца пути
+        [HarmonyPatch(typeof(Tameable), "GetHoverName")]
+        [HarmonyPostfix]
+        private static void Tameable_GetHoverName_Postfix(Tameable __instance, ref string __result)
+        {
+            if (__instance == null) return;
+            Character c = __instance.GetComponent<Character>();
+            if (c == null || !IsTroll(c) || !c.IsTamed()) return;
+            ZNetView nv = __instance.GetComponent<ZNetView>();
+            if (nv == null || !nv.IsValid() || nv.GetZDO() == null) return;
+            ZDO zdo = nv.GetZDO();
+            if (!zdo.GetBool(TrollWalkConstants.HashActive, false)) return;
+            string rn = zdo.GetString(TrollWalkConstants.HashName, "");
+            if (!string.IsNullOrEmpty(rn)) __result = rn;
+        }
+
+        // ============ [Y]: карта сразу, без окна имени ============
+
+        [HarmonyPatch(typeof(Player), "Update")]
+        [HarmonyPostfix]
+        private static void Player_Update_Postfix(Player __instance)
+        {
+            if (__instance != Player.m_localPlayer || __instance.IsDead()) return;
+            if (!Input.GetKeyDown(KeyCode.Y)) return;
+            if (TextInput.IsVisible() || Minimap.InTextInput()) return;
+            if (Chat.instance != null && Chat.instance.HasFocus()) return;
+            if (global::Console.IsVisible() || Menu.IsActive() || InventoryGui.IsVisible() || Hud.InRadial()) return;
+            if (TrollWalkRouteSession.Active) return;
+
+            GameObject hover = __instance.GetHoverObject();
+            if (hover == null) return;
+            if (hover.GetComponentInParent<TrollPieceTag>() != null) return;
+            Character troll = hover.GetComponentInParent<Character>();
+            if (troll == null || !IsTroll(troll) || !troll.IsTamed() || troll.IsDead()) return;
+            ZNetView nv = troll.GetComponent<ZNetView>();
+            if (nv == null || !nv.IsValid() || nv.GetZDO() == null) return;
+
+            TrollWalkRouteSession.Begin(nv.GetZDO().m_uid);
+        }
+
+        // ============ Менеджер ============
+
+        [HarmonyPatch(typeof(ZNetScene), "Awake")]
+        [HarmonyPostfix]
+        private static void ZNetScene_Awake_Postfix()
+        {
+            TrollWalkManager.EnsureCreated();
+        }
+
+        [HarmonyPatch(typeof(Minimap), "UpdateDynamicPins")]
+        [HarmonyPostfix]
+        private static void Minimap_UpdateDynamicPins_Postfix()
+        {
+            TrollWalkManager.Instance?.UpdatePins();
+        }
+
+        // Выход с карты = применение маршрута
+        [HarmonyPatch(typeof(Minimap), "SetMapMode")]
+        [HarmonyPostfix]
+        private static void Minimap_SetMapMode_Postfix(Minimap __instance, Minimap.MapMode mode)
+        {
+            if (!TrollWalkRouteSession.Active) return;
+            if (mode == Minimap.MapMode.Large) return;
+            TrollWalkRouteSession.CommitAndClose();
+        }
+
+        // Выбор ванильной иконки снимает выбор нашей
+        [HarmonyPatch(typeof(Minimap), "SelectIcon")]
+        [HarmonyPostfix]
+        private static void Minimap_SelectIcon_Postfix()
+        {
+            if (TrollWalkRouteSession.s_selectGuard || !TrollWalkRouteSession.Active) return;
+            if (TrollWalkRouteSession.IconSelected) TrollWalkRouteSession.SetIconSelected(false);
+        }
+
+        // ============ Постановка пина пути: ванильный ввод имени,
+        // подключённый к НАШЕМУ стегинг-пину ============
+
+        [HarmonyPatch(typeof(Minimap), "ShowPinNameInput")]
+        [HarmonyPrefix]
+        private static bool Minimap_ShowPinNameInput_Prefix(Minimap __instance, Vector3 pos)
+        {
+            if (!TrollWalkRouteSession.Active || !TrollWalkRouteSession.IconSelected) return true;
+
+            Minimap.PinData pin = TrollWalkRouteSession.StagingPin;
+            if (pin == null)
+            {
+                pin = TrollWalkManager.AddPinSafe(__instance, pos, "", TrollWalkIcons.Road);
+                if (pin != null) TrollWalkRouteSession.StagingPin = pin;
+            }
+            else
+            {
+                pin.m_pos = pos; // повторный клик — переносим точку
+                TrollWalkManager.SetPinUpdateRequired(__instance, true);
+            }
+            if (pin == null) return true; // сбой — пусть ваниль
+
+            GuiInputField input = s_nameInputRef(__instance);
+            if (input == null) return true;
+
+            s_namePinRef(__instance) = pin; // ваниль запишет имя в наш пин
+            input.text = "";
+            input.gameObject.SetActive(true);
+
+            if (ZInput.IsExclusiveGamepadActive() && !ZInput.IsTouchActive())
+            {
+                input.gameObject.transform.localPosition = new Vector3(0f, -30f, 0f);
+            }
+            else
+            {
+                RectTransform parentRect = input.gameObject.transform.parent != null
+                    ? input.gameObject.transform.parent.GetComponent<RectTransform>() : null;
+                if (parentRect != null && RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                        parentRect, ZInput.pointerPosition, null, out Vector2 v))
+                    input.gameObject.transform.localPosition = new Vector3(v.x, v.y - 30f);
+            }
+
+            input.ActivateInputField();
+            s_wasFocusedRef(__instance) = true;
+            return false;
+        }
+
+        // ============ Защита пинов ============
+
+        [HarmonyPatch(typeof(Minimap), "RemovePin", new[] { typeof(Minimap.PinData) })]
+        [HarmonyPrefix]
+        private static bool Minimap_RemovePin_Prefix(Minimap __instance, Minimap.PinData pin)
+        {
+            if (TrollWalkManager.s_internalRemove) return true;
+            if (!TrollWalkManager.IsOurPin(pin)) return true;
+            return TrollWalkManager.HandleOurPinRemoval(__instance, pin);
+        }
+
+        [HarmonyPatch(typeof(Minimap), "RemovePin", new[] { typeof(Vector3), typeof(float) })]
+        [HarmonyPrefix]
+        private static bool Minimap_RemovePin_Pos_Prefix(Minimap __instance, Vector3 pos, float radius)
+        {
+            if (TrollWalkManager.s_internalRemove) return true;
+            Minimap.PinData our = TrollWalkManager.FindClosestOurPin(__instance, pos, radius);
+            if (our == null) return true;
+            return TrollWalkManager.HandleOurPinRemoval(__instance, our);
+        }
+
+        // ============ Синхронизация ZDO активных троллей всем клиентам ============
+
+        [HarmonyPatch(typeof(ZDOMan), "CreateSyncList")]
+        [HarmonyPostfix]
+        private static void ZDOMan_CreateSyncList_Postfix(ZDOMan __instance, List<ZDO> toSync)
+        {
+            try
+            {
+                if (toSync == null || ZNet.instance == null || !ZNet.instance.IsServer()) return;
+                if (TrollWalkManager.Instance == null) return;
+                List<ZDOID> ids = TrollWalkManager.Instance.ActiveRouteIds;
+                if (ids.Count == 0) return;
+                foreach (ZDOID id in ids)
+                {
+                    ZDO zdo = __instance.GetZDO(id);
+                    if (zdo != null && zdo.Persistent && !toSync.Contains(zdo)) toSync.Add(zdo);
+                }
+            }
+            catch { }
+        }
+    }
+
+    #endregion
+}

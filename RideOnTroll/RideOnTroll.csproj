@@ -10,8 +10,20 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Remove="icon\road.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="icon\road.png" />
+    <EmbeddedResource Include="icon\troll.png" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="0Harmony">
       <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\r2modman\Valheim\profiles\VPOtest\BepInEx\core\0Harmony.dll</HintPath>
+    </Reference>
+    <Reference Include="gui_framework">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\gui_framework.dll</HintPath>
     </Reference>
 <Reference Include="mscorlib">
       <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\r2modman\Valheim\profiles\VPOtest\BepInEx\core\mscorlib.dll</HintPath>
@@ -36,6 +48,9 @@
     </Reference>
     <Reference Include="Unity.Collections">
       <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\Unity.Collections.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\Unity.TextMeshPro.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine">
       <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.dll</HintPath>
