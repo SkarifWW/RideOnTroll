@@ -1,4 +1,5 @@
-﻿using HarmonyLib;
+﻿using GUIFramework;
+using HarmonyLib;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -6,10 +7,9 @@ using System.Linq;
 using System.Reflection;
 using TrollTamerMod;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.Rendering;
 using UnityEngine.UI;
-using GUIFramework;
-using UnityEngine.EventSystems;
 
 namespace TrollBuildingMod
 {
@@ -31,13 +31,11 @@ namespace TrollBuildingMod
         public static readonly int HashLastUpdate = KeyLastUpdate.GetStableHashCode();
         public static readonly int HashSpeed = KeySpeed.GetStableHashCode();
 
-        public const float ArriveRadius = 3f;
-        public const float RunDistance = 15f;
-        public const float DefaultSpeed = 3.5f;
-        public const float TelemetryInterval = 2f;
-        public const float VirtualStepInterval = 2f;
-        public const float ThrashInterval = 2.2f;
-        public const float ThrashCancelAfterSeconds = 0f;
+        public const float ArriveRadius = 3f;       // «пришёл»
+        public const float RunDistance = 15f;       // дальше — бежит
+        public const float DefaultSpeed = 3.5f;     // м/с до первого замера
+        public const float TelemetryInterval = 2f;   // владелец пишет LastPos/Speed
+        public const float VirtualStepInterval = 2f; // «виртуальный ходок» вне зоны
 
         public static readonly string[] TrollPrefabNames = { "Troll", "Troll_Log" };
 
@@ -144,7 +142,6 @@ namespace TrollBuildingMod
             return null;
         }
 
-        // Пост-обработка как в AegisDome
         private static Sprite PostProcess(Texture2D tex)
         {
             tex.wrapMode = TextureWrapMode.Clamp;
@@ -181,25 +178,17 @@ namespace TrollBuildingMod
         private ZNetView m_nview;
         private MonsterAI m_ai;
 
+        // MoveTo — protected в BaseAI, вызываем рефлексией
         private static readonly MethodInfo s_moveTo = AccessTools.Method(typeof(BaseAI), "MoveTo");
 
         private float m_telemetryTimer;
         private Vector3 m_telLastPos;
-        private float m_thrashTimer;
-        private float m_shoveTimer;
-        private Vector3 m_shoveDir;
-        private Vector3 m_stuckCheckPos;
-        private float m_stuckCheckTimer;
-        private float m_stuckAccum;
-        private float m_noPathTimer;
-        private float m_thrashTotal;
 
         private void Awake()
         {
             m_character = GetComponent<Character>();
             m_nview = GetComponent<ZNetView>();
             m_ai = GetComponent<MonsterAI>();
-            m_stuckCheckPos = transform.position;
             m_telLastPos = transform.position;
             if (m_character != null)
             {
@@ -213,6 +202,7 @@ namespace TrollBuildingMod
             try { CatchUpOnLoad(); } catch { }
         }
 
+        // Компенсация «шёл, пока никто не видел»: доигрываем по расписанию
         private void CatchUpOnLoad()
         {
             if (m_nview == null || !m_nview.IsValid()) return;
@@ -220,7 +210,7 @@ namespace TrollBuildingMod
             if (zdo == null || !zdo.GetBool(TrollWalkConstants.HashActive, false)) return;
 
             if (!zdo.HasOwner()) zdo.SetOwner(ZDOMan.GetSessionID());
-            if (!zdo.IsOwner()) return;
+            if (!zdo.IsOwner()) return; // владелец где-то есть — он и разрулит
 
             long tick = zdo.GetLong(TrollWalkConstants.HashLastUpdate, 0L);
             double elapsed = tick > 0 ? Math.Max(0.0, (ZNet.instance.GetTime() - new DateTime(tick)).TotalSeconds) : 0;
@@ -246,6 +236,9 @@ namespace TrollBuildingMod
             }
         }
 
+        // Вызывается постфиксом MonsterAI.UpdateAI (только у владельца — проверка внутри).
+        // Движение — ТОЛЬКО ванильный MoveTo (путь, обход препятствий, corner-escape).
+        // Никаких ударов/рывков: при недостижимости тролль стоит и ретраит путь сам.
         public void TickAI(float dt)
         {
             if (m_nview == null || !m_nview.IsValid() || !m_nview.IsOwner()) return;
@@ -255,85 +248,45 @@ namespace TrollBuildingMod
             ZDO zdo = m_nview.GetZDO();
             if (zdo == null || !zdo.GetBool(TrollWalkConstants.HashActive, false)) return;
             if (TrollTamePatches.IsFrozenTroll(m_character)) return;
+            if (m_ai.IsSleeping()) return;
 
-            if (m_ai.GetTargetCreature() != null || m_ai.GetStaticTarget() != null)
-            {
-                m_noPathTimer = 0f; m_stuckAccum = 0f;
-                return;
-            }
+            // Бой: ваниль сама ведёт тролля к врагу (patrol сброшен при отправке,
+            // поэтому цель больше не сбрасывается «далеко от патрульной точки»)
+            if (m_ai.GetTargetCreature() != null || m_ai.GetStaticTarget() != null) return;
             if (m_character.InAttack() || m_character.IsStaggering()) return;
-
-            if (m_shoveTimer > 0f)
-            {
-                m_shoveTimer -= dt;
-                m_character.SetMoveDir(m_shoveDir);
-                m_character.SetRun(false);
-                return;
-            }
 
             Vector3 target = zdo.GetVec3(TrollWalkConstants.HashTarget, transform.position);
             float dist = Utils.DistanceXZ(target, transform.position);
-            bool run = dist > TrollWalkConstants.RunDistance;
 
-            bool arrived = (bool)s_moveTo.Invoke(m_ai,
-                new object[] { dt, target, TrollWalkConstants.ArriveRadius, run });
-
-            if (arrived)
+            // Пришли: явная остановка + финализация (patrol/follow уже чисты —
+            // ванильный idle после этого держит тролля на месте, без возврата назад)
+            if (dist <= TrollWalkConstants.ArriveRadius)
             {
-                if (dist <= TrollWalkConstants.ArriveRadius + 0.5f)
-                {
-                    FinishRoute(zdo);
-                    return;
-                }
-                m_noPathTimer += dt;
-            }
-            else
-            {
-                m_noPathTimer = 0f;
+                m_ai.StopMoving();
+                FinishRoute(zdo);
+                return;
             }
 
-            UpdateStuck(dt);
-
-            m_thrashTimer -= dt;
-            bool stuck = m_noPathTimer > 1f || m_stuckAccum >= 4f;
-            if (stuck && m_thrashTimer <= 0f)
+            // Чистый ванильный MoveTo. Возврат true при «пути нет» означает
+            // «стоим и ждём» — FindPath пересчитает сам (1–5 с).
+            s_moveTo.Invoke(m_ai, new object[]
             {
-                m_thrashTimer = TrollWalkConstants.ThrashInterval;
-                m_noPathTimer = 0f;
-                m_stuckAccum = 0f;
-                m_thrashTotal += TrollWalkConstants.ThrashInterval;
-
-                if (TrollWalkConstants.ThrashCancelAfterSeconds > 0f &&
-                    m_thrashTotal > TrollWalkConstants.ThrashCancelAfterSeconds)
-                {
-                    FinishRoute(zdo, cancelled: true);
-                    return;
-                }
-
-                m_character.StartAttack(null, false);
-                Vector2 r = UnityEngine.Random.insideUnitCircle;
-                if (r.sqrMagnitude < 0.01f) r = Vector2.right;
-                r.Normalize();
-                m_shoveDir = new Vector3(r.x, 0f, r.y);
-                m_shoveTimer = 0.6f;
-            }
-        }
-
-        private void UpdateStuck(float dt)
-        {
-            m_stuckCheckTimer -= dt;
-            if (m_stuckCheckTimer > 0f) return;
-            m_stuckCheckTimer = 0.5f;
-            float moved = Utils.DistanceXZ(transform.position, m_stuckCheckPos);
-            m_stuckCheckPos = transform.position;
-            if (moved < 0.2f) m_stuckAccum += 0.5f;
-            else m_stuckAccum = 0f;
+                dt, target, TrollWalkConstants.ArriveRadius, dist > TrollWalkConstants.RunDistance
+            });
         }
 
         private void FinishRoute(ZDO zdo, bool cancelled = false)
         {
             if (!zdo.IsOwner()) zdo.SetOwner(ZDOMan.GetSessionID());
             zdo.Set(TrollWalkConstants.HashActive, false);
+
+            // страхуемся от «якорей возврата»
+            try
+            {
+                if (m_ai != null) m_ai.ResetPatrolPoint();
+                zdo.Set(ZDOVars.s_patrol, false);
+            }
+            catch { }
 
             Player p = Player.m_localPlayer;
             if (p != null && Utils.DistanceXZ(p.transform.position, transform.position) < 60f)
@@ -368,6 +321,7 @@ namespace TrollBuildingMod
             try { Telemetry(); } catch { }
         }
 
+        // Владелец пишет в ZDO: где тролль, когда, с какой скоростью (для карты вне зоны)
         private void Telemetry()
         {
             if (m_nview == null || !m_nview.IsValid() || !m_nview.IsOwner()) return;
@@ -481,6 +435,7 @@ namespace TrollBuildingMod
             TrollWalkRouteSession.HardReset();
         }
 
+        // Виртуальный ходок (сервер/одиночка): тролль вне зоны симуляции
         private void VirtualStep()
         {
             List<ZDOID> ids = s_routes.Keys.ToList();
@@ -491,10 +446,10 @@ namespace TrollBuildingMod
 
                 long owner = zdo.GetOwner();
                 if (owner != 0L && owner != ZDOMan.GetSessionID() && ZNet.instance.GetPeer(owner) != null)
-                    continue;
+                    continue; // владелец-пир онлайн — он и симулирует
 
                 if (ZNetScene.instance != null && ZNetScene.instance.FindInstance(zdo) != null)
-                    continue;
+                    continue; // GO существует у сервера
 
                 if (owner != ZDOMan.GetSessionID()) zdo.SetOwner(ZDOMan.GetSessionID());
 
@@ -528,6 +483,7 @@ namespace TrollBuildingMod
             }
         }
 
+        // Фоновый поиск троллей с активными маршрутами (по ZDO, без GO)
         private void BackgroundScan()
         {
             if (m_scanProcessing)
@@ -573,8 +529,9 @@ namespace TrollBuildingMod
             ZDO zdo = ZDOMan.instance.GetZDO(trollId);
             if (zdo == null) return;
 
-            // не отправляем мёртвого
             ZNetView inst = ZNetScene.instance != null ? ZNetScene.instance.FindInstance(zdo) : null;
+
+            // не отправляем мёртвого
             if (inst != null)
             {
                 Character c = inst.GetComponent<Character>();
@@ -585,6 +542,25 @@ namespace TrollBuildingMod
                     return;
                 }
             }
+
+            // Снимаем ВСЕ «якоря» возврата и следования:
+            //  - patrol point: иначе ваниль сбрасывает боевые цели дальше alertRange от неё
+            //    и тянет тролля назад к точке, где он стоял
+            //  - follow: иначе idle-ветка водит тролля за игроком
+            //  - random-move цель: мгновенный сброс текущего блуждания (анти-кручение)
+            try
+            {
+                MonsterAI ai = inst != null ? inst.GetComponent<MonsterAI>() : null;
+                if (ai != null)
+                {
+                    ai.ResetPatrolPoint();
+                    ai.SetFollowTarget(null);
+                    ai.ResetRandomMovement();
+                }
+                zdo.Set(ZDOVars.s_patrol, false);
+                zdo.Set(ZDOVars.s_follow, "");
+            }
+            catch { }
 
             zdo.SetOwner(ZDOMan.GetSessionID());
 
@@ -736,6 +712,8 @@ namespace TrollBuildingMod
             SetPinUpdateRequired(mm, true);
         }
 
+        // ============ Безопасные вызовы пинов (без референса на Splatform) ============
+
         internal static Minimap.PinData AddPinSafe(Minimap mm, Vector3 pos, string name, Sprite icon)
         {
             if (s_addPin == null || mm == null) return null;
@@ -751,7 +729,7 @@ namespace TrollBuildingMod
                     new object[] { pos, Minimap.PinType.None, name, false, false, 0L, s_puidDefault }) as Minimap.PinData;
                 if (pin != null)
                 {
-                    pin.m_icon = icon;
+                    pin.m_icon = icon; // паттерн локационных пинов ванили
                     if (!string.IsNullOrEmpty(name))
                     {
                         try { pin.m_NamePinData = new Minimap.PinNameData(pin); } catch { }
@@ -946,7 +924,7 @@ namespace TrollBuildingMod
             DestroyToolbarButton();
         }
 
-        // ============ Кнопка "пин пути" в меню иконок (клон ванильной иконки) ============
+        // ============ Кнопка «пин пути» в меню иконок (клон ванильной иконки) ============
 
         private static void BuildToolbarButton()
         {
@@ -973,7 +951,7 @@ namespace TrollBuildingMod
                 target.sprite = TrollWalkIcons.Road;
                 target.color = Color.white;
 
-                // позиция: справа от самой правой иконки (или порядок в layout-группе)
+                // позиция: справа от самой правой иконки меню
                 RectTransform srcRt = src.transform as RectTransform;
                 RectTransform rt = go.transform as RectTransform;
                 Vector2 spacing = new Vector2(45f, 0f);
@@ -1065,6 +1043,23 @@ namespace TrollBuildingMod
             if (ctrl != null) ctrl.TickAI(dt);
         }
 
+        // ГЛАВНЫЙ АНТИ-КРУТЯЩИЙ ФИКС: во время маршрута ванильный idle
+        // (RandomMovement к patrol/random-цели, перезапись moveDir/lookDir
+        // ДО нашего постфикса) полностью отключается — единственный источник
+        // движения к цели — наш MoveTo в постфиксе UpdateAI.
+        [HarmonyPatch(typeof(BaseAI), "IdleMovement")]
+        [HarmonyPrefix]
+        private static bool BaseAI_IdleMovement_Prefix(BaseAI __instance)
+        {
+            if (__instance == null) return true;
+            Character c = __instance.GetComponent<Character>();
+            if (c == null || !IsTroll(c)) return true;
+
+            ZNetView nv = __instance.GetComponent<ZNetView>();
+            if (nv == null || !nv.IsValid() || nv.GetZDO() == null) return true;
+            return !nv.GetZDO().GetBool(TrollWalkConstants.HashActive, false); // false = пропустить idle
+        }
+
         // ============ Ховер: через Tameable (запекается в строку, которую
         // пишет TrollTamePatches — порядок патчей не важен) ============
 
@@ -1143,13 +1138,13 @@ namespace TrollBuildingMod
             TrollWalkManager.Instance?.UpdatePins();
         }
 
-        // Выход с карты = применение маршрута
+        // Выход с карты = применение маршрута (ОБЯЗАТЕЛЬНЫЙ выход)
         [HarmonyPatch(typeof(Minimap), "SetMapMode")]
         [HarmonyPostfix]
         private static void Minimap_SetMapMode_Postfix(Minimap __instance, Minimap.MapMode mode)
         {
             if (!TrollWalkRouteSession.Active) return;
-            if (mode == Minimap.MapMode.Large) return;
+            if (mode == Minimap.MapMode.Large) return; // открытие — не закрываем сессию
             TrollWalkRouteSession.CommitAndClose();
         }
 
