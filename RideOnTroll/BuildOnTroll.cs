@@ -1617,4 +1617,85 @@ namespace TrollBuildingMod
     }
 
     #endregion
+
+    #region Полный игнор урона от троллей по постройкам на троллях
+
+    // =====================================================================
+    // Любой урон, источник которого — ТРОЛЛЬ (любой: сам носитель, чужой
+    // приручённый, дикий), ПОЛНОСТЬЮ игнорируется, если цель — постройка,
+    // закреплённая на тролле (TrollPieceTag + живой контейнер).
+    // Проходит как в ванили: урон от игроков, врагов, погоды; удары
+    // троллей по обычным (не тролльим) постройкам; снятие построек
+    // молотом (Remove/RPC_Remove — не через Damage).
+    //
+    // Цепочка урона по постройкам (сверено с WearNTear.cs этой версии):
+    //   Attack -> IDestructible.Damage(hit) -> InvokeRPC("RPC_Damage")
+    //   -> сеть -> RPC_Damage(sender, hit) [у владельца ZDO]
+    //   -> ApplyDamage(totalDamage, hit)
+    // Перехватываем первые два звена:
+    //   1) Damage     — у атакующего: RPC вообще не отправляется;
+    //   2) RPC_Damage — у владельца: страховка от прямых RPC-вызовов.
+    // Блокировка до RPC_Damage гасит и цифры урона, и эффекты удара.
+    // =====================================================================
+
+    internal static class TrollPieceDamageFilter
+    {
+        private static float s_lastLog = -10f;
+
+        private static bool IsTroll(Character c)
+        {
+            return c != null && c.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool ShouldBlock(WearNTear wnt, HitData hit)
+        {
+            try
+            {
+                if (wnt == null || hit == null) return false;
+
+                // Цель — постройка, закреплённая на тролле?
+                // (Container == null => постройка отвалилась — урон снова
+                //  проходит, она уже не «постройка на тролле»)
+                TrollPieceTag tag = wnt.GetComponent<TrollPieceTag>();
+                if (tag == null || tag.Container == null) return false;
+
+                // Источник удара — тролль? (любой, не только носитель)
+                Character attacker = hit.GetAttacker();
+                if (!IsTroll(attacker)) return false;
+
+                if (Time.time - s_lastLog > 10f)
+                {
+                    s_lastLog = Time.time;
+                    Debug.Log($"[TrollBuild] Blocked troll damage: '{attacker.name}' -> piece '{wnt.gameObject.name}' mounted on a troll");
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    [HarmonyPatch]
+    public static class TrollWearNTearDamageGuard
+    {
+        // Вход IDestructible: в этой версии Damage только отправляет RPC
+        [HarmonyPatch(typeof(WearNTear), "Damage")]
+        [HarmonyPrefix]
+        private static bool Damage_Prefix(WearNTear __instance, HitData hit)
+        {
+            return !TrollPieceDamageFilter.ShouldBlock(__instance, hit);
+        }
+
+        // Применение урона у владельца ZDO — вторая линия
+        [HarmonyPatch(typeof(WearNTear), "RPC_Damage")]
+        [HarmonyPrefix]
+        private static bool RPC_Damage_Prefix(WearNTear __instance, HitData hit)
+        {
+            return !TrollPieceDamageFilter.ShouldBlock(__instance, hit);
+        }
+    }
+
+    #endregion
 }
