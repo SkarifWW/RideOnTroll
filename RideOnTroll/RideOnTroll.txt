@@ -1,0 +1,1415 @@
+### FILE: BuildOnTroll.cs
+using System;
+using System.Collections.Generic;
+using HarmonyLib;
+using UnityEngine;
+
+namespace TrollBuildingMod
+{
+    #region Constants & Context
+
+    public enum TrollBuildTargetType
+    {
+        None,
+        TrollSkin,
+        TrollPiece
+    }
+
+    public static class TrollBuildConstants
+    {
+        public const string KeyTrollUUID = "TrollBuild_TrollUUID";
+        public const string KeyParentPieceUID = "TrollBuild_ParentPieceUID";
+        public const string KeyLocalPos = "TrollBuild_LocalPos";
+        public const string KeyLocalRot = "TrollBuild_LocalRot";
+        public const string KeyHasLocal = "TrollBuild_HasLocal";
+
+        public static readonly int HashTrollUUID = KeyTrollUUID.GetStableHashCode();
+        public static readonly int HashParentPieceUID = KeyParentPieceUID.GetStableHashCode();
+        public static readonly int HashLocalPos = KeyLocalPos.GetStableHashCode();
+        public static readonly int HashLocalRot = KeyLocalRot.GetStableHashCode();
+        public static readonly int HashHasLocal = KeyHasLocal.GetStableHashCode();
+
+        // Базовый оффсет точки крепления на спине тролля относительно корня префаба
+        public static readonly Vector3 DefaultBuildRootOffset = new Vector3(0f, 3.35f, -0.25f);
+    }
+
+    public static class TrollBuildContext
+    {
+        public static TrollBuildTargetType TargetType = TrollBuildTargetType.None;
+        public static TrollPiecesContainer TargetContainer = null;
+        public static Character TargetTroll = null;
+        public static Piece TargetPiece = null;
+        public static Vector3 TargetPoint = Vector3.zero;
+        public static Vector3 TargetNormal = Vector3.up;
+
+        public static void SetTargetSkin(TrollPiecesContainer container, Vector3 point, Vector3 normal)
+        {
+            TargetType = TrollBuildTargetType.TrollSkin;
+            TargetContainer = container;
+            TargetTroll = container != null ? container.TrollCharacter : null;
+            TargetPiece = null;
+            TargetPoint = point;
+            TargetNormal = normal;
+        }
+
+        public static void SetTargetPiece(TrollPiecesContainer container, Piece piece, Vector3 point, Vector3 normal)
+        {
+            TargetType = TrollBuildTargetType.TrollPiece;
+            TargetContainer = container;
+            TargetTroll = container != null ? container.TrollCharacter : null;
+            TargetPiece = piece;
+            TargetPoint = point;
+            TargetNormal = normal;
+        }
+
+        public static void Reset()
+        {
+            TargetType = TrollBuildTargetType.None;
+            TargetContainer = null;
+            TargetTroll = null;
+            TargetPiece = null;
+            TargetPoint = Vector3.zero;
+            TargetNormal = Vector3.up;
+        }
+    }
+
+    public class TrollPieceTag : MonoBehaviour
+    {
+        public TrollPiecesContainer Container;
+    }
+
+    #endregion
+
+    #region Container & Carrier Root
+
+    public class TrollPiecesContainer : MonoBehaviour
+    {
+        public Character TrollCharacter { get; private set; }
+        public string TrollUUID { get; private set; } = "";
+
+        private Transform m_buildRoot;
+        public Transform BuildRoot => m_buildRoot;
+
+        private readonly List<ZNetView> m_attachedPieces = new List<ZNetView>();
+        public List<ZNetView> AttachedPieces => m_attachedPieces;
+
+        private Collider[] m_trollColliders = Array.Empty<Collider>();
+        private float m_spatialSyncTimer = 0f;
+        private Vector3 m_lastSpatialSyncPos = Vector3.zero;
+
+        private void Awake()
+        {
+            TrollCharacter = GetComponent<Character>();
+            InitUUID();
+            EnsureBuildRoot();
+            CacheTrollColliders();
+
+            if (TrollCharacter != null)
+            {
+                TrollCharacter.m_onDeath = (Action)Delegate.Combine(TrollCharacter.m_onDeath, new Action(OnTrollDeath));
+            }
+        }
+
+        private void Start()
+        {
+            InitUUID();
+            EnsureBuildRoot();
+            CacheTrollColliders();
+            m_lastSpatialSyncPos = transform.position;
+
+            if (!string.IsNullOrEmpty(TrollUUID))
+            {
+                TrollPieceAttachmentQueue.CheckPending(TrollUUID, this);
+            }
+        }
+
+        public void InitUUID()
+        {
+            if (!string.IsNullOrEmpty(TrollUUID)) return;
+
+            ZNetView nview = GetComponent<ZNetView>();
+            if (nview && nview.GetZDO() != null)
+            {
+                // ZDOID тролля как стабильный персистентный идентификатор
+                TrollUUID = nview.GetZDO().m_uid.ToString();
+                TrollRegistry.RegisterTroll(TrollUUID, this);
+            }
+        }
+
+        public void EnsureBuildRoot()
+        {
+            if (m_buildRoot != null) return;
+
+            Transform existing = transform.Find("TrollBuildRoot");
+            if (existing != null)
+            {
+                m_buildRoot = existing;
+            }
+            else
+            {
+                GameObject rootObj = new GameObject("TrollBuildRoot");
+                rootObj.transform.SetParent(transform, false);
+                rootObj.transform.localPosition = TrollBuildConstants.DefaultBuildRootOffset;
+                rootObj.transform.localRotation = Quaternion.identity;
+                rootObj.transform.localScale = Vector3.one;
+                m_buildRoot = rootObj.transform;
+            }
+        }
+
+        public void CacheTrollColliders()
+        {
+            m_trollColliders = GetComponentsInChildren<Collider>(true);
+        }
+
+        public void RegisterPiece(ZNetView pieceView, Vector3 localPos, Quaternion localRot)
+        {
+            if (pieceView == null || !pieceView.IsValid()) return;
+            EnsureBuildRoot();
+
+            if (!m_attachedPieces.Contains(pieceView))
+            {
+                m_attachedPieces.Add(pieceView);
+            }
+
+            // Прикрепляем к общему физическому Rigidbody тролля через TrollBuildRoot
+            pieceView.transform.SetParent(m_buildRoot, false);
+            pieceView.transform.localPosition = localPos;
+            pieceView.transform.localRotation = localRot;
+            pieceView.transform.localScale = Vector3.one;
+
+            TrollPieceTag tag = pieceView.GetComponent<TrollPieceTag>() ?? pieceView.gameObject.AddComponent<TrollPieceTag>();
+            tag.Container = this;
+
+            WearNTear wnt = pieceView.GetComponent<WearNTear>();
+            if (wnt != null)
+            {
+                wnt.m_staticPosition = false;
+            }
+
+            ZSyncTransform syncTransform = pieceView.GetComponent<ZSyncTransform>();
+            if (syncTransform != null)
+            {
+                syncTransform.enabled = false;
+            }
+
+            IgnoreCollisionsWithTrollBody(pieceView.gameObject);
+        }
+
+        public void IgnoreCollisionsWithTrollBody(GameObject pieceObj)
+        {
+            if (m_trollColliders == null || m_trollColliders.Length == 0)
+                CacheTrollColliders();
+
+            Collider[] pieceCols = pieceObj.GetComponentsInChildren<Collider>(true);
+            foreach (var pc in pieceCols)
+            {
+                if (!pc || pc.isTrigger) continue;
+
+                // Игнорируем только столкновения между троллем и постройкой.
+                // Коллизии между постройкой и игроком остаются ванильными!
+                foreach (var tc in m_trollColliders)
+                {
+                    if (tc && tc != pc)
+                    {
+                        Physics.IgnoreCollision(tc, pc, true);
+                    }
+                }
+            }
+        }
+
+        private void FixedUpdate()
+        {
+            if (!string.IsNullOrEmpty(TrollUUID) && TrollPieceAttachmentQueue.HasPending(TrollUUID))
+            {
+                TrollPieceAttachmentQueue.CheckPending(TrollUUID, this);
+            }
+
+            // Периодическое обновление мировых координат в ZDO для стриминга зон Valheim
+            m_spatialSyncTimer += Time.fixedDeltaTime;
+            if (m_spatialSyncTimer >= 1.5f)
+            {
+                m_spatialSyncTimer = 0f;
+                if (Vector3.Distance(transform.position, m_lastSpatialSyncPos) > 1.0f)
+                {
+                    m_lastSpatialSyncPos = transform.position;
+                    SyncPiecesWorldZDO();
+                }
+            }
+        }
+
+        public void SyncPiecesWorldZDO()
+        {
+            ZNetView trollNv = GetComponent<ZNetView>();
+            if (trollNv == null || !trollNv.IsValid() || !trollNv.IsOwner()) return;
+
+            for (int i = m_attachedPieces.Count - 1; i >= 0; i--)
+            {
+                var pieceView = m_attachedPieces[i];
+                if (pieceView == null || !pieceView.IsValid())
+                {
+                    m_attachedPieces.RemoveAt(i);
+                    continue;
+                }
+
+                ZDO zdo = pieceView.GetZDO();
+                if (zdo != null)
+                {
+                    zdo.SetPosition(pieceView.transform.position);
+                    zdo.SetRotation(pieceView.transform.rotation);
+                }
+            }
+        }
+
+        public void OnPieceDestroyed(WearNTear wnt)
+        {
+            if (wnt == null) return;
+            ZNetView nv = wnt.GetComponent<ZNetView>();
+            if (nv != null)
+            {
+                m_attachedPieces.Remove(nv);
+            }
+            m_attachedPieces.RemoveAll(p => p == null || !p.IsValid());
+        }
+
+        public void OnTrollDeath()
+        {
+            for (int i = m_attachedPieces.Count - 1; i >= 0; i--)
+            {
+                ZNetView pieceView = m_attachedPieces[i];
+                if (pieceView == null || !pieceView.IsValid()) continue;
+
+                pieceView.GetZDO().Set(TrollBuildConstants.HashTrollUUID, "");
+
+                Piece piece = pieceView.GetComponent<Piece>();
+                if (piece != null)
+                {
+                    piece.DropResources(null);
+                }
+
+                pieceView.Destroy();
+            }
+
+            m_attachedPieces.Clear();
+            TrollPieceAttachmentQueue.ClearQueueForTroll(TrollUUID);
+        }
+
+        private void OnDestroy()
+        {
+            TrollRegistry.UnregisterTroll(TrollUUID);
+
+            if (TrollCharacter != null && TrollCharacter.IsDead())
+            {
+                OnTrollDeath();
+            }
+        }
+    }
+
+    #endregion
+
+    #region Registry & Attachment Queue
+
+    public static class TrollRegistry
+    {
+        private static readonly Dictionary<string, TrollPiecesContainer> s_containers = new Dictionary<string, TrollPiecesContainer>();
+
+        public static void RegisterTroll(string uuid, TrollPiecesContainer container)
+        {
+            if (!string.IsNullOrEmpty(uuid) && container != null)
+            {
+                s_containers[uuid] = container;
+            }
+        }
+
+        public static void UnregisterTroll(string uuid)
+        {
+            if (!string.IsNullOrEmpty(uuid))
+            {
+                s_containers.Remove(uuid);
+            }
+        }
+
+        public static bool TryGetTroll(string uuid, out TrollPiecesContainer container)
+        {
+            return s_containers.TryGetValue(uuid, out container) && container != null;
+        }
+    }
+
+    public static class TrollPieceAttachmentQueue
+    {
+        private static readonly Dictionary<string, List<ZNetView>> s_pending = new Dictionary<string, List<ZNetView>>();
+
+        public static void Enqueue(string trollUUID, ZNetView piece)
+        {
+            if (string.IsNullOrEmpty(trollUUID) || piece == null) return;
+
+            if (!s_pending.TryGetValue(trollUUID, out var list))
+            {
+                list = new List<ZNetView>();
+                s_pending[trollUUID] = list;
+            }
+
+            if (!list.Contains(piece))
+            {
+                list.Add(piece);
+            }
+        }
+
+        public static bool HasPending(string trollUUID)
+        {
+            return !string.IsNullOrEmpty(trollUUID) && s_pending.TryGetValue(trollUUID, out var list) && list.Count > 0;
+        }
+
+        public static void ClearQueueForTroll(string trollUUID)
+        {
+            if (!string.IsNullOrEmpty(trollUUID))
+            {
+                s_pending.Remove(trollUUID);
+            }
+        }
+
+        public static void CheckPending(string trollUUID, TrollPiecesContainer container)
+        {
+            if (string.IsNullOrEmpty(trollUUID) || container == null) return;
+
+            if (s_pending.TryGetValue(trollUUID, out var list))
+            {
+                for (int i = list.Count - 1; i >= 0; i--)
+                {
+                    ZNetView pieceView = list[i];
+                    if (pieceView == null || !pieceView.IsValid())
+                    {
+                        list.RemoveAt(i);
+                        continue;
+                    }
+
+                    Attach(container, pieceView);
+                    list.RemoveAt(i);
+                }
+
+                if (list.Count == 0)
+                {
+                    s_pending.Remove(trollUUID);
+                }
+            }
+        }
+
+        public static void Attach(TrollPiecesContainer container, ZNetView pieceView)
+        {
+            if (!container || !pieceView || !pieceView.IsValid()) return;
+
+            container.EnsureBuildRoot();
+            ZDO zdo = pieceView.GetZDO();
+            bool hasSavedLocal = zdo.GetBool(TrollBuildConstants.HashHasLocal, false);
+
+            Vector3 localPos;
+            Quaternion localRot;
+
+            if (hasSavedLocal)
+            {
+                localPos = zdo.GetVec3(TrollBuildConstants.HashLocalPos, Vector3.zero);
+                localRot = Quaternion.Euler(zdo.GetVec3(TrollBuildConstants.HashLocalRot, Vector3.zero));
+            }
+            else
+            {
+                localPos = container.BuildRoot.InverseTransformPoint(pieceView.transform.position);
+                localRot = Quaternion.Inverse(container.BuildRoot.rotation) * pieceView.transform.rotation;
+
+                if (pieceView.IsOwner())
+                {
+                    zdo.Set(TrollBuildConstants.HashHasLocal, true);
+                    zdo.Set(TrollBuildConstants.HashLocalPos, localPos);
+                    zdo.Set(TrollBuildConstants.HashLocalRot, localRot.eulerAngles);
+                }
+            }
+
+            container.RegisterPiece(pieceView, localPos, localRot);
+        }
+    }
+
+    #endregion
+
+    #region Structural Support (WearNTear Adapter)
+
+    public static class TrollBuildSupport
+    {
+        public static void CalculateTrollPieceSupport(WearNTear wnt)
+        {
+            if (wnt == null || !wnt.GetComponent<ZNetView>().IsValid()) return;
+
+            TrollPieceTag tag = wnt.GetComponent<TrollPieceTag>();
+            if (tag == null || tag.Container == null) return;
+
+            ZDO zdo = wnt.GetComponent<ZNetView>().GetZDO();
+            ZDOID parentPieceUID = zdo.GetZDOID(TrollBuildConstants.KeyParentPieceUID);
+
+            // Если деталь установлена на кожу тролля (фундамент) — она получает полную опору от тролля
+            if (parentPieceUID.IsNone())
+            {
+                float maxSup = GetMaxSupportForPiece(wnt);
+                SetSupport(wnt, maxSup);
+                return;
+            }
+
+            // Если деталь крепится к другой детали — рассчитываем поддержку от соседних WearNTear на тролле
+            float maxSupport = GetMaxSupportForPiece(wnt);
+            float highestNeighborSupport = 0f;
+            Vector3 myPos = wnt.transform.position;
+
+            Collider[] neighbors = Physics.OverlapSphere(myPos, 3.5f, LayerMask.GetMask("piece", "piece_nonsolid"));
+            foreach (var col in neighbors)
+            {
+                if (col.isTrigger) continue;
+                WearNTear otherWnt = col.GetComponentInParent<WearNTear>();
+                if (otherWnt == null || otherWnt == wnt) continue;
+
+                TrollPieceTag otherTag = otherWnt.GetComponent<TrollPieceTag>();
+                if (otherTag != null && otherTag.Container == tag.Container)
+                {
+                    float otherSupport = otherWnt.GetComponent<ZNetView>().GetZDO().GetFloat(ZDOVars.s_support, maxSupport);
+                    float dist = Vector3.Distance(myPos, otherWnt.transform.position);
+
+                    // Стандартное затухание Valheim в зависимости от расстояния
+                    float loss = 0.125f;
+                    float propagated = otherSupport - (loss * dist * otherSupport);
+                    if (propagated > highestNeighborSupport)
+                    {
+                        highestNeighborSupport = propagated;
+                    }
+                }
+            }
+
+            float finalSupport = Mathf.Clamp(highestNeighborSupport, 0f, maxSupport);
+            SetSupport(wnt, finalSupport);
+        }
+
+        private static void SetSupport(WearNTear wnt, float support)
+        {
+            ZNetView nv = wnt.GetComponent<ZNetView>();
+            if (nv != null && nv.IsValid())
+            {
+                nv.GetZDO().Set(ZDOVars.s_support, support);
+            }
+        }
+
+        private static float GetMaxSupportForPiece(WearNTear wnt)
+        {
+            switch (wnt.m_materialType)
+            {
+                case WearNTear.MaterialType.Wood: return 100f;
+                case WearNTear.MaterialType.Stone: return 1000f;
+                case WearNTear.MaterialType.Iron: return 1500f;
+                case WearNTear.MaterialType.HardWood: return 140f;
+                case WearNTear.MaterialType.Marble: return 1500f;
+                case WearNTear.MaterialType.Ashstone: return 2000f;
+                default: return 100f;
+            }
+        }
+    }
+
+    #endregion
+
+    #region Harmony Placement & Physics Patches
+
+    [HarmonyPatch]
+    public static class TrollBuildingPatches
+    {
+        private static readonly AccessTools.FieldRef<Player, int> PlaceRayMaskRef =
+            AccessTools.FieldRefAccess<Player, int>("m_placeRayMask");
+
+        private static readonly AccessTools.FieldRef<Player, int> PlaceWaterRayMaskRef =
+            AccessTools.FieldRefAccess<Player, int>("m_placeWaterRayMask");
+
+        private static readonly AccessTools.FieldRef<Player, int> PlaceRotationRef =
+            AccessTools.FieldRefAccess<Player, int>("m_placeRotation");
+
+        private static readonly AccessTools.FieldRef<Player, float> PlaceRotationDegreesRef =
+            AccessTools.FieldRefAccess<Player, float>("m_placeRotationDegrees");
+
+        private static readonly AccessTools.FieldRef<Player, GameObject> PlacementGhostRef =
+            AccessTools.FieldRefAccess<Player, GameObject>("m_placementGhost");
+
+        private struct SavedPlacementFlags
+        {
+            public bool GroundPiece;
+            public bool GroundOnly;
+            public bool CultivatedGroundOnly;
+            public bool VegetationGroundOnly;
+            public bool Active;
+        }
+        private static SavedPlacementFlags s_savedFlags;
+
+        [HarmonyPatch(typeof(Character), "Awake")]
+        [HarmonyPostfix]
+        private static void Character_Awake_Postfix(Character __instance)
+        {
+            if (__instance != null && __instance.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase))
+            {
+                if (__instance.GetComponent<TrollPiecesContainer>() == null)
+                {
+                    __instance.gameObject.AddComponent<TrollPiecesContainer>();
+                }
+            }
+        }
+
+        // =========================================================================
+        // ПЕРЕХВАТ PieceRayTest С СОХРАНЕНИЕМ ВАНИЛЬНОГО ПРИОРИТЕТА
+        // =========================================================================
+        [HarmonyPatch(typeof(Player), "PieceRayTest")]
+        [HarmonyPrefix]
+        private static bool PieceRayTest_Prefix(
+            Player __instance,
+            ref bool __result,
+            out Vector3 point,
+            out Vector3 normal,
+            out Piece piece,
+            out Heightmap heightmap,
+            out Collider waterSurface,
+            bool water)
+        {
+            point = Vector3.zero;
+            normal = Vector3.up;
+            piece = null;
+            heightmap = null;
+            waterSurface = null;
+
+            TrollBuildContext.Reset();
+
+            if (GameCamera.instance == null) return true;
+
+            int layerMask = water
+                ? PlaceWaterRayMaskRef(__instance)
+                : PlaceRayMaskRef(__instance);
+
+            if (layerMask == 0)
+            {
+                layerMask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "piece_nonsolid", "terrain", "vehicle");
+            }
+
+            int combinedMask = layerMask | LayerMask.GetMask("character", "character_net");
+            Ray ray = new Ray(GameCamera.instance.transform.position, GameCamera.instance.transform.forward);
+            RaycastHit[] hits = Physics.RaycastAll(ray, 50f, combinedMask);
+
+            if (hits.Length == 0) return true;
+
+            Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+            float maxDist = __instance.m_maxPlaceDistance;
+            Transform eye = __instance.m_eye;
+            Vector3 eyePos = eye != null ? eye.position : GameCamera.instance.transform.position;
+
+            for (int i = 0; i < hits.Length; i++)
+            {
+                RaycastHit hit = hits[i];
+                if (Vector3.Distance(eyePos, hit.point) > maxDist) continue;
+
+                // Случай Б: луч попал в ранее построенную деталь на тролле
+                TrollPieceTag tag = hit.collider.GetComponentInParent<TrollPieceTag>();
+                if (tag != null && tag.Container != null)
+                {
+                    Piece hitPiece = hit.collider.GetComponentInParent<Piece>();
+                    TrollBuildContext.SetTargetPiece(tag.Container, hitPiece, hit.point, hit.normal);
+
+                    point = hit.point;
+                    normal = hit.normal;
+                    piece = hitPiece;
+                    heightmap = null;
+
+                    __result = true;
+                    return false;
+                }
+
+                // Случай А: луч попал непосредственно в прирученного тролля
+                Character character = hit.collider.GetComponentInParent<Character>();
+                if (character != null && character.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase) && character.IsTamed())
+                {
+                    TrollPiecesContainer container = character.GetComponent<TrollPiecesContainer>() ?? character.gameObject.AddComponent<TrollPiecesContainer>();
+                    container.EnsureBuildRoot();
+
+                    Vector3 buildNormal = container.BuildRoot.up;
+                    TrollBuildContext.SetTargetSkin(container, hit.point, buildNormal);
+
+                    point = hit.point;
+                    normal = buildNormal;
+                    piece = null;
+                    heightmap = null;
+
+                    __result = true;
+                    return false;
+                }
+
+                // Случай В: если луч встретил обычную мировую геометрию раньше тролля — отдаем выполнение ванильному коду
+                if (hit.collider.attachedRigidbody == null)
+                {
+                    return true;
+                }
+            }
+
+            return true;
+        }
+
+        // =========================================================================
+        // ВРЕМЕННАЯ АДАПТАЦИЯ ТРЕБОВАНИЙ ЗЕМЛИ ТОЛЬКО ДЛЯ КОЖИ ТРОЛЛЯ
+        // =========================================================================
+        [HarmonyPatch(typeof(Player), "UpdatePlacementGhost")]
+        [HarmonyPrefix]
+        private static void UpdatePlacementGhost_Prefix(Player __instance)
+        {
+            GameObject ghost = PlacementGhostRef(__instance);
+            if (ghost == null) return;
+
+            Piece piece = ghost.GetComponent<Piece>();
+            if (piece == null) return;
+
+            s_savedFlags.Active = false;
+
+            // Адаптируем флаги строго только при первом строительстве на спину тролля
+            if (TrollBuildContext.TargetType == TrollBuildTargetType.TrollSkin)
+            {
+                s_savedFlags.GroundPiece = piece.m_groundPiece;
+                s_savedFlags.GroundOnly = piece.m_groundOnly;
+                s_savedFlags.CultivatedGroundOnly = piece.m_cultivatedGroundOnly;
+                s_savedFlags.VegetationGroundOnly = piece.m_vegetationGroundOnly;
+                s_savedFlags.Active = true;
+
+                piece.m_groundPiece = false;
+                piece.m_groundOnly = false;
+                piece.m_cultivatedGroundOnly = false;
+                piece.m_vegetationGroundOnly = false;
+            }
+        }
+
+        [HarmonyPatch(typeof(Player), "UpdatePlacementGhost")]
+        [HarmonyPostfix]
+        private static void UpdatePlacementGhost_Postfix(Player __instance)
+        {
+            GameObject ghost = PlacementGhostRef(__instance);
+            if (ghost != null && s_savedFlags.Active)
+            {
+                Piece piece = ghost.GetComponent<Piece>();
+                if (piece != null)
+                {
+                    piece.m_groundPiece = s_savedFlags.GroundPiece;
+                    piece.m_groundOnly = s_savedFlags.GroundOnly;
+                    piece.m_cultivatedGroundOnly = s_savedFlags.CultivatedGroundOnly;
+                    piece.m_vegetationGroundOnly = s_savedFlags.VegetationGroundOnly;
+                }
+                s_savedFlags.Active = false;
+            }
+
+            if (ghost == null || TrollBuildContext.TargetType != TrollBuildTargetType.TrollSkin || TrollBuildContext.TargetContainer == null)
+            {
+                return;
+            }
+
+            // Для фундамента на спине сопоставляем угол вращения с ориентацией платформы тролля
+            TrollPiecesContainer container = TrollBuildContext.TargetContainer;
+            if (container.BuildRoot != null)
+            {
+                int placeRot = PlaceRotationRef(__instance);
+                float placeRotDeg = PlaceRotationDegreesRef(__instance);
+                ghost.transform.rotation = container.BuildRoot.rotation * Quaternion.Euler(0f, placeRot * placeRotDeg, 0f);
+            }
+        }
+
+        // =========================================================================
+        // ПРИВЯЗКА ПОСЛЕ ВАНИЛЬНОГО PlacePiece (ИСТОЧНИК ИСТИНЫ — pos/rot)
+        // =========================================================================
+        [HarmonyPatch(typeof(Player), "PlacePiece")]
+        [HarmonyPostfix]
+        private static void PlacePiece_Postfix(Player __instance, Piece piece, Vector3 pos, Quaternion rot)
+        {
+            if (TrollBuildContext.TargetType == TrollBuildTargetType.None || TrollBuildContext.TargetContainer == null)
+            {
+                TrollBuildContext.Reset();
+                return;
+            }
+
+            TrollPiecesContainer container = TrollBuildContext.TargetContainer;
+            Transform root = container.BuildRoot;
+            if (root == null)
+            {
+                TrollBuildContext.Reset();
+                return;
+            }
+
+            container.InitUUID();
+
+            Piece placedPiece = null;
+            var placedList = AccessTools.StaticFieldRefAccess<List<IPlaced>>(typeof(Player), "m_placed");
+            if (placedList != null && placedList.Count > 0)
+            {
+                for (int i = placedList.Count - 1; i >= 0; i--)
+                {
+                    if (placedList[i] is Piece p && !Player.IsPlacementGhost(p.gameObject))
+                    {
+                        placedPiece = p;
+                        break;
+                    }
+                }
+            }
+
+            if (placedPiece == null)
+            {
+                Collider[] colliders = Physics.OverlapSphere(pos, 1.5f);
+                float minDist = float.MaxValue;
+                foreach (var col in colliders)
+                {
+                    Piece p = col.GetComponentInParent<Piece>();
+                    if (p != null && !Player.IsPlacementGhost(p.gameObject))
+                    {
+                        float d = Vector3.Distance(p.transform.position, pos);
+                        if (d < minDist)
+                        {
+                            minDist = d;
+                            placedPiece = p;
+                        }
+                    }
+                }
+            }
+
+            if (placedPiece != null)
+            {
+                ZNetView nview = placedPiece.GetComponent<ZNetView>();
+                if (nview != null && nview.IsValid())
+                {
+                    // Расчет локального положения относительно TrollBuildRoot
+                    Vector3 localPos = root.InverseTransformPoint(pos);
+                    Quaternion localRot = Quaternion.Inverse(root.rotation) * rot;
+
+                    ZDO zdo = nview.GetZDO();
+                    zdo.Set(TrollBuildConstants.HashTrollUUID, container.TrollUUID);
+                    zdo.Set(TrollBuildConstants.HashLocalPos, localPos);
+                    zdo.Set(TrollBuildConstants.HashLocalRot, localRot.eulerAngles);
+                    zdo.Set(TrollBuildConstants.HashHasLocal, true);
+
+                    if (TrollBuildContext.TargetPiece != null)
+                    {
+                        ZNetView parentNv = TrollBuildContext.TargetPiece.GetComponent<ZNetView>();
+                        if (parentNv != null && parentNv.GetZDO() != null)
+                        {
+                            zdo.Set(TrollBuildConstants.KeyParentPieceUID, parentNv.GetZDO().m_uid);
+                        }
+                    }
+
+                    container.RegisterPiece(nview, localPos, localRot);
+
+                    WearNTear wnt = placedPiece.GetComponent<WearNTear>();
+                    if (wnt != null)
+                    {
+                        TrollBuildSupport.CalculateTrollPieceSupport(wnt);
+                    }
+                }
+            }
+
+            TrollBuildContext.Reset();
+        }
+
+        // =========================================================================
+        // ИНТЕГРАЦИЯ WearNTear
+        // =========================================================================
+        [HarmonyPatch(typeof(WearNTear), "UpdateSupport")]
+        [HarmonyPrefix]
+        private static bool WearNTear_UpdateSupport_Prefix(WearNTear __instance)
+        {
+            if (__instance.GetComponent<TrollPieceTag>() != null)
+            {
+                TrollBuildSupport.CalculateTrollPieceSupport(__instance);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(WearNTear), "OnDestroy")]
+        [HarmonyPostfix]
+        private static void WearNTear_OnDestroy_Postfix(WearNTear __instance)
+        {
+            if (__instance == null) return;
+            TrollPieceTag tag = __instance.GetComponent<TrollPieceTag>();
+            if (tag != null && tag.Container != null)
+            {
+                tag.Container.OnPieceDestroyed(__instance);
+            }
+        }
+
+        // =========================================================================
+        // СЕТЕВАЯ СИНХРОНИЗАЦИЯ И ЗАГРУЗКА
+        // =========================================================================
+        [HarmonyPatch(typeof(ZSyncTransform), "ClientSync")]
+        [HarmonyPrefix]
+        private static bool ZSyncTransform_ClientSync_Prefix(ZSyncTransform __instance)
+        {
+            if (__instance != null && __instance.GetComponent<TrollPieceTag>() != null)
+            {
+                // Локальная трансформация под TrollBuildRoot является источником истины
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(ZNetView), "Awake")]
+        [HarmonyPostfix]
+        private static void ZNetView_Awake_Postfix(ZNetView __instance)
+        {
+            if (__instance == null || __instance.GetZDO() == null) return;
+
+            string trollUUID = __instance.GetZDO().GetString(TrollBuildConstants.HashTrollUUID, "");
+            if (!string.IsNullOrEmpty(trollUUID))
+            {
+                if (__instance.GetComponent<TrollPieceTag>() != null) return;
+
+                if (TrollRegistry.TryGetTroll(trollUUID, out TrollPiecesContainer container))
+                {
+                    TrollPieceAttachmentQueue.Attach(container, __instance);
+                }
+                else
+                {
+                    TrollPieceAttachmentQueue.Enqueue(trollUUID, __instance);
+                }
+            }
+        }
+    }
+
+    #endregion
+}
+
+### FILE: RideOnTroll.csproj
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\r2modman\Valheim\profiles\VPOtest\BepInEx\core\0Harmony.dll</HintPath>
+    </Reference>
+<Reference Include="mscorlib">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\r2modman\Valheim\profiles\VPOtest\BepInEx\core\mscorlib.dll</HintPath>
+    </Reference>
+    <Reference Include="assembly_guiutils">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\assembly_guiutils.dll</HintPath>
+    </Reference>
+    <Reference Include="assembly_postprocessing">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\assembly_postprocessing.dll</HintPath>
+    </Reference>
+    <Reference Include="assembly_utils">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\assembly_utils.dll</HintPath>
+    </Reference>
+    <Reference Include="assembly_valheim">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\assembly_valheim.dll</HintPath>
+    </Reference>
+    <Reference Include="BepInEx">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\r2modman\Valheim\profiles\VPOtest\BepInEx\core\BepInEx.dll</HintPath>
+    </Reference>
+    <Reference Include="com.rlabrecque.steamworks.net">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\com.rlabrecque.steamworks.net.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.Collections">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\Unity.Collections.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.AnimationModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.AnimationModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.AudioModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.AudioModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.ImageConversionModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.ImageConversionModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.IMGUIModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.InputLegacyModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.ParticleSystemModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.TerrainModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.TerrainModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.TextRenderingModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.UI.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>..\..\..\..\STEAM_NEW\steamapps\common\Valheim\Valheim_Data\Managed\UnityEngine.UIModule.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
+
+### FILE: TrollFriend.cs
+using System;
+using BepInEx;
+using HarmonyLib;
+using TrollBuildingMod;
+using UnityEngine;
+
+namespace TrollTamerMod
+{
+    [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
+    public class TrollTamerPlugin : BaseUnityPlugin
+    {
+        public const string PluginGUID = "com.custom.trolltamer";
+        public const string PluginName = "TrollTamer";
+        public const string PluginVersion = "1.4.0";
+
+        private Harmony _harmony;
+
+        private void Awake()
+        {
+            _harmony = new Harmony(PluginGUID);
+            _harmony.PatchAll();
+            Logger.LogInfo("TrollTamer & RideOnTroll загружен успешно.");
+        }
+
+        private void OnDestroy()
+        {
+            _harmony?.UnpatchSelf();
+        }
+    }
+
+    public class TrollFreezeController : MonoBehaviour
+    {
+        private Character _character;
+        private ZNetView _nview;
+        private Rigidbody _body;
+        private ZSyncAnimation _zanim;
+        private Animator[] _animators;
+
+        private Vector3 _lockedPosition;
+        private Quaternion _lockedRotation;
+        private bool _isCurrentlyFrozen = false;
+
+        private void Awake()
+        {
+            _character = GetComponent<Character>();
+            _nview = GetComponent<ZNetView>();
+            _body = GetComponent<Rigidbody>();
+            _zanim = GetComponent<ZSyncAnimation>();
+            _animators = GetComponentsInChildren<Animator>(true);
+        }
+
+        private void Start()
+        {
+            _animators = GetComponentsInChildren<Animator>(true);
+        }
+
+        private void FixedUpdate()
+        {
+            if (_nview == null || !_nview.IsValid()) return;
+
+            bool shouldBeFrozen = _character.IsTamed() && _nview.GetZDO().GetBool(TrollTamePatches.ZDO_FREEZE_KEY, false);
+
+            if (shouldBeFrozen)
+            {
+                if (!_isCurrentlyFrozen)
+                {
+                    _isCurrentlyFrozen = true;
+                    _lockedPosition = transform.position;
+                    _lockedRotation = transform.rotation;
+
+                    if (_body != null)
+                    {
+                        _body.linearVelocity = Vector3.zero;
+                        _body.angularVelocity = Vector3.zero;
+                        _body.isKinematic = true;
+                    }
+                }
+
+                if (_zanim != null && _zanim.enabled)
+                {
+                    _zanim.enabled = false;
+                }
+
+                if (_animators != null)
+                {
+                    for (int i = 0; i < _animators.Length; i++)
+                    {
+                        if (_animators[i] != null && _animators[i].enabled)
+                        {
+                            _animators[i].enabled = false;
+                        }
+                    }
+                }
+
+                transform.position = _lockedPosition;
+                transform.rotation = _lockedRotation;
+            }
+            else
+            {
+                if (_isCurrentlyFrozen)
+                {
+                    _isCurrentlyFrozen = false;
+
+                    if (_body != null)
+                    {
+                        _body.isKinematic = false;
+                        _body.linearVelocity = Vector3.zero;
+                        _body.angularVelocity = Vector3.zero;
+                    }
+
+                    if (_zanim != null && !_zanim.enabled)
+                    {
+                        _zanim.enabled = true;
+                    }
+
+                    if (_animators != null)
+                    {
+                        for (int i = 0; i < _animators.Length; i++)
+                        {
+                            if (_animators[i] != null && !_animators[i].enabled)
+                            {
+                                _animators[i].enabled = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public class TrollTamingTracker : MonoBehaviour
+    {
+        private MonsterAI _monsterAI;
+        private Character _character;
+        private ZNetView _nview;
+
+        private float _timer = 0f;
+        private const float RequiredTime = 60f;
+        public const string FailedKey = "TrollHitByPlayer";
+
+        private void Awake()
+        {
+            _monsterAI = GetComponent<MonsterAI>();
+            _character = GetComponent<Character>();
+            _nview = GetComponent<ZNetView>();
+        }
+
+        private void Update()
+        {
+            if (_nview == null || !_nview.IsValid() || !_nview.IsOwner())
+            {
+                Destroy(this);
+                return;
+            }
+
+            if (_character.IsDead() || _character.IsTamed() || _nview.GetZDO().GetBool(FailedKey, false))
+            {
+                Destroy(this);
+                return;
+            }
+
+            Character target = _monsterAI.GetTargetCreature();
+
+            if (target != null && target.IsPlayer() && _monsterAI.IsAlerted())
+            {
+                _timer += Time.deltaTime;
+                if (_timer >= RequiredTime)
+                {
+                    CompleteTaming();
+                }
+            }
+            else
+            {
+                Destroy(this);
+            }
+        }
+
+        public void AbortPermanently()
+        {
+            _nview?.GetZDO()?.Set(FailedKey, true);
+            Destroy(this);
+        }
+
+        private void CompleteTaming()
+        {
+            _monsterAI.MakeTame();
+
+            Tameable tameable = GetComponent<Tameable>();
+            if (tameable != null)
+            {
+                tameable.m_commandable = true;
+                tameable.m_fedDuration = 1800f;
+            }
+
+            Player closestPlayer = Player.GetClosestPlayer(transform.position, 30f);
+            if (closestPlayer != null)
+            {
+                closestPlayer.Message(MessageHud.MessageType.Center, $"{_character.m_name} покорен вашей стойкостью!", 0, null, false);
+            }
+
+            Destroy(this);
+        }
+    }
+
+    [HarmonyPatch]
+    public static class TrollTamePatches
+    {
+        public const string ZDO_FREEZE_KEY = "TrollBuild_IsFrozen";
+
+        public static bool IsTroll(Character character)
+        {
+            return character != null && character.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static bool IsFrozenTroll(Character character)
+        {
+            if (!IsTroll(character) || !character.IsTamed()) return false;
+            ZNetView nv = character.GetComponent<ZNetView>();
+            return nv != null && nv.IsValid() && nv.GetZDO().GetBool(ZDO_FREEZE_KEY, false);
+        }
+
+        [HarmonyPatch(typeof(ZNetScene), "Awake")]
+        [HarmonyPostfix]
+        public static void ZNetScene_Awake_Postfix(ZNetScene __instance)
+        {
+            if (__instance == null) return;
+
+            string[] trollPrefabs = { "Troll", "Troll_Log" };
+            foreach (string name in trollPrefabs)
+            {
+                GameObject prefab = __instance.GetPrefab(name);
+                if (prefab != null)
+                {
+                    SetupTrollComponents(prefab);
+                }
+            }
+        }
+
+        public static void SetupTrollComponents(GameObject go)
+        {
+            Tameable tame = go.GetComponent<Tameable>() ?? go.AddComponent<Tameable>();
+            tame.m_commandable = true;
+            tame.m_nameBeforeText = true;
+            tame.m_tameText = "$hud_tamelove";
+            tame.m_fedDuration = 1800f;
+            tame.m_tamingTime = 60f;
+
+            if (go.GetComponent<TrollFreezeController>() == null)
+            {
+                go.AddComponent<TrollFreezeController>();
+            }
+        }
+
+        [HarmonyPatch(typeof(Character), "Awake")]
+        [HarmonyPostfix]
+        public static void Character_Awake_Postfix(Character __instance)
+        {
+            if (IsTroll(__instance))
+            {
+                SetupTrollComponents(__instance.gameObject);
+            }
+        }
+
+        [HarmonyPatch(typeof(Character), "CustomFixedUpdate")]
+        [HarmonyPrefix]
+        public static bool Character_CustomFixedUpdate_Prefix(Character __instance)
+        {
+            if (IsFrozenTroll(__instance))
+            {
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(MonsterAI), "UpdateAI")]
+        [HarmonyPrefix]
+        public static bool MonsterAI_UpdateAI_Prefix(MonsterAI __instance)
+        {
+            Character c = __instance.GetComponent<Character>();
+            if (IsFrozenTroll(c))
+            {
+                __instance.StopMoving();
+                return false;
+            }
+            return true;
+        }
+
+        // ИСПРАВЛЕНИЕ: Игнорируем постройки на платформе при взаимодействии с троллем
+        [HarmonyPatch(typeof(Player), "Interact")]
+        [HarmonyPrefix]
+        public static bool Player_Interact_Prefix(Player __instance, GameObject go, bool hold, bool alt)
+        {
+            if (go == null) return true;
+
+            // Если игрок взаимодействует с объектом платформы (дверь, сундук и т.д.), не перехватываем
+            if (go.GetComponentInParent<TrollPieceTag>() != null)
+            {
+                return true;
+            }
+
+            Character character = go.GetComponentInParent<Character>();
+            if (IsTroll(character) && character.IsTamed())
+            {
+                Tameable tameable = character.GetComponent<Tameable>();
+                if (tameable != null)
+                {
+                    if (tameable.Interact(__instance, hold, alt))
+                    {
+                        AccessTools.Method(typeof(Humanoid), "DoInteractAnimation")?.Invoke(__instance, new object[] { character.gameObject });
+                    }
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(Character), "GetHoverText")]
+        [HarmonyPostfix]
+        public static void Character_GetHoverText_Postfix(Character __instance, ref string __result)
+        {
+            if (IsTroll(__instance) && __instance.IsTamed())
+            {
+                Tameable tame = __instance.GetComponent<Tameable>();
+                if (tame != null)
+                {
+                    __result = tame.GetHoverText();
+                }
+
+                ZNetView nv = __instance.GetComponent<ZNetView>();
+                if (nv != null && nv.IsValid())
+                {
+                    bool isFrozen = nv.GetZDO().GetBool(ZDO_FREEZE_KEY, false);
+                    string stateText = isFrozen
+                        ? "<color=#55FF55>ВКЛ</color>"
+                        : "<color=#FF5555>ВЫКЛ</color>";
+
+                    __result += $"\n[<color=yellow><b>Зажать $KEY_Use</b></color>] Не двигайся: {stateText}";
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(Character), "GetHoverName")]
+        [HarmonyPostfix]
+        public static void Character_GetHoverName_Postfix(Character __instance, ref string __result)
+        {
+            if (IsTroll(__instance) && __instance.IsTamed())
+            {
+                Tameable tame = __instance.GetComponent<Tameable>();
+                if (tame != null)
+                {
+                    __result = tame.GetHoverName();
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(MonsterAI), "UpdateTarget")]
+        [HarmonyPostfix]
+        public static void MonsterAI_UpdateTarget_Postfix(MonsterAI __instance, Character ___m_targetCreature)
+        {
+            if (!IsTroll(__instance.GetComponent<Character>())) return;
+
+            Character character = __instance.GetComponent<Character>();
+            if (character == null || character.IsTamed()) return;
+
+            if (___m_targetCreature != null && ___m_targetCreature.IsPlayer())
+            {
+                ZNetView nview = __instance.GetComponent<ZNetView>();
+                if (nview == null || !nview.IsValid()) return;
+
+                if (nview.GetZDO().GetBool(TrollTamingTracker.FailedKey, false)) return;
+
+                if (__instance.GetComponent<TrollTamingTracker>() == null)
+                {
+                    __instance.gameObject.AddComponent<TrollTamingTracker>();
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(Character), "RPC_Damage")]
+        [HarmonyPrefix]
+        public static void Character_RPC_Damage_Prefix(Character __instance, HitData hit)
+        {
+            if (!IsTroll(__instance)) return;
+            if (__instance.IsTamed()) return;
+
+            Character attacker = hit.GetAttacker();
+            if (attacker != null && attacker.IsPlayer())
+            {
+                ZNetView nview = __instance.GetComponent<ZNetView>();
+                if (nview != null && nview.IsValid())
+                {
+                    nview.GetZDO().Set(TrollTamingTracker.FailedKey, true);
+
+                    TrollTamingTracker tracker = __instance.GetComponent<TrollTamingTracker>();
+                    tracker?.AbortPermanently();
+
+                    (attacker as Player)?.Message(MessageHud.MessageType.TopLeft, "Тролль разъярен полученным ударом! Приручение сорвано навсегда.", 0, null, false);
+                }
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(Player), "Update")]
+    public static class Player_HoldE_TrollFreeze_Patch
+    {
+        private static float _holdTimer = 0f;
+        private static bool _holdExecuted = false;
+        private const float HOLD_REQUIRED_TIME = 0.6f;
+
+        [HarmonyPostfix]
+        public static void Postfix(Player __instance)
+        {
+            if (__instance != Player.m_localPlayer) return;
+
+            if (!ZInput.GetButton("Use") && !ZInput.GetButton("JoyUse"))
+            {
+                _holdTimer = 0f;
+                _holdExecuted = false;
+                return;
+            }
+
+            GameObject hoverObj = __instance.GetHoverObject();
+            if (hoverObj == null) return;
+
+            // Если смотрим на постройку на тролле — не переключаем заморозку
+            if (hoverObj.GetComponentInParent<TrollPieceTag>() != null) return;
+
+            Character character = hoverObj.GetComponentInParent<Character>();
+            if (character == null || !TrollTamePatches.IsTroll(character) || !character.IsTamed()) return;
+
+            ZNetView nview = character.GetComponent<ZNetView>();
+            if (nview == null || !nview.IsValid()) return;
+
+            _holdTimer += Time.deltaTime;
+            if (_holdTimer >= HOLD_REQUIRED_TIME && !_holdExecuted)
+            {
+                _holdExecuted = true;
+                ToggleFreeze(character, nview);
+            }
+        }
+
+        private static void ToggleFreeze(Character character, ZNetView nview)
+        {
+            bool currentState = nview.GetZDO().GetBool(TrollTamePatches.ZDO_FREEZE_KEY, false);
+            bool newState = !currentState;
+
+            nview.ClaimOwnership();
+            nview.GetZDO().Set(TrollTamePatches.ZDO_FREEZE_KEY, newState);
+
+            string message = newState
+                ? "Режим неподвижности: ВКЛЮЧЕН"
+                : "Режим неподвижности: ВЫКЛЮЧЕН";
+
+            MessageHud.instance?.ShowMessage(MessageHud.MessageType.Center, message);
+        }
+    }
+}
+

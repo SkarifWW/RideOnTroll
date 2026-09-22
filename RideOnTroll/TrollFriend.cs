@@ -1,6 +1,7 @@
 ﻿using System;
 using BepInEx;
 using HarmonyLib;
+using TrollBuildingMod;
 using UnityEngine;
 
 namespace TrollTamerMod
@@ -10,7 +11,7 @@ namespace TrollTamerMod
     {
         public const string PluginGUID = "com.custom.trolltamer";
         public const string PluginName = "TrollTamer";
-        public const string PluginVersion = "1.3.2";
+        public const string PluginVersion = "1.4.0";
 
         private Harmony _harmony;
 
@@ -18,7 +19,7 @@ namespace TrollTamerMod
         {
             _harmony = new Harmony(PluginGUID);
             _harmony.PatchAll();
-            Logger.LogInfo("TrollTamer Mod (Режим полной заморозки) загружен успешно.");
+            Logger.LogInfo("TrollTamer & RideOnTroll загружен успешно.");
         }
 
         private void OnDestroy()
@@ -27,10 +28,6 @@ namespace TrollTamerMod
         }
     }
 
-    /// <summary>
-    /// Контроллер полной остановки тролля.
-    /// Отключает физику, AI и замораживает скелет/анимации в текущей позе.
-    /// </summary>
     public class TrollFreezeController : MonoBehaviour
     {
         private Character _character;
@@ -54,7 +51,6 @@ namespace TrollTamerMod
 
         private void Start()
         {
-            // Обновляем список аниматоров после полной инициализации префаба
             _animators = GetComponentsInChildren<Animator>(true);
         }
 
@@ -74,14 +70,12 @@ namespace TrollTamerMod
 
                     if (_body != null)
                     {
-                        // Обнуляем скорость СТРОГО ДО включения isKinematic!
                         _body.linearVelocity = Vector3.zero;
                         _body.angularVelocity = Vector3.zero;
                         _body.isKinematic = true;
                     }
                 }
 
-                // Гарантированно выключаем анимации, чтобы кости скелета застыли
                 if (_zanim != null && _zanim.enabled)
                 {
                     _zanim.enabled = false;
@@ -98,12 +92,8 @@ namespace TrollTamerMod
                     }
                 }
 
-                // Намертво фиксируем положение и поворот в пространстве
                 transform.position = _lockedPosition;
                 transform.rotation = _lockedRotation;
-
-                // ВНИМАНИЕ: Не трогаем _body.linearVelocity пока _body.isKinematic == true,
-                // иначе Unity спамит в консоль предупреждениями.
             }
             else
             {
@@ -118,7 +108,6 @@ namespace TrollTamerMod
                         _body.angularVelocity = Vector3.zero;
                     }
 
-                    // Включаем анимацию обратно
                     if (_zanim != null && !_zanim.enabled)
                     {
                         _zanim.enabled = true;
@@ -272,19 +261,17 @@ namespace TrollTamerMod
             }
         }
 
-        // БЛОКИРУЕМ стандартную физику персонажа Valheim (предотвращает спам логов кинематики и смещение тела)
         [HarmonyPatch(typeof(Character), "CustomFixedUpdate")]
         [HarmonyPrefix]
         public static bool Character_CustomFixedUpdate_Prefix(Character __instance)
         {
             if (IsFrozenTroll(__instance))
             {
-                return false; // Полностью отключаем UpdateBody, гравитацию и физические расчеты
+                return false;
             }
             return true;
         }
 
-        // БЛОКИРУЕМ логику поведения ИИ, когда тролль заморожен
         [HarmonyPatch(typeof(MonsterAI), "UpdateAI")]
         [HarmonyPrefix]
         public static bool MonsterAI_UpdateAI_Prefix(MonsterAI __instance)
@@ -298,11 +285,18 @@ namespace TrollTamerMod
             return true;
         }
 
+        // ИСПРАВЛЕНИЕ: Игнорируем постройки на платформе при взаимодействии с троллем
         [HarmonyPatch(typeof(Player), "Interact")]
         [HarmonyPrefix]
         public static bool Player_Interact_Prefix(Player __instance, GameObject go, bool hold, bool alt)
         {
             if (go == null) return true;
+
+            // Если игрок взаимодействует с объектом платформы (дверь, сундук и т.д.), не перехватываем
+            if (go.GetComponentInParent<TrollPieceTag>() != null)
+            {
+                return true;
+            }
 
             Character character = go.GetComponentInParent<Character>();
             if (IsTroll(character) && character.IsTamed())
@@ -427,6 +421,9 @@ namespace TrollTamerMod
 
             GameObject hoverObj = __instance.GetHoverObject();
             if (hoverObj == null) return;
+
+            // Если смотрим на постройку на тролле — не переключаем заморозку
+            if (hoverObj.GetComponentInParent<TrollPieceTag>() != null) return;
 
             Character character = hoverObj.GetComponentInParent<Character>();
             if (character == null || !TrollTamePatches.IsTroll(character) || !character.IsTamed()) return;
