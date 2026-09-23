@@ -34,6 +34,9 @@ namespace TrollBuildingMod
         public const float MaxTurnSpeedWithPieces = 60f;
 
         public static bool IsDedicatedServer => SystemInfo.graphicsDeviceType == GraphicsDeviceType.Null;
+
+        public const string KeyPieces = "TrollBuild_Pieces";
+        public static readonly int HashPieces = KeyPieces.GetStableHashCode();
     }
 
     public static class TrollBuildContext
@@ -370,6 +373,16 @@ namespace TrollBuildingMod
             if (tag == null) tag = pieceView.gameObject.AddComponent<TrollPieceTag>();
             tag.Container = this;
 
+            // персистентная запись: ZDOID постройки в ZDO тролля (для
+            // восстановления виртуальной езды после перезахода)
+            try
+            {
+                ZDO trollZdo = GetComponent<ZNetView>()?.GetZDO();
+                if (trollZdo != null && pieceView.GetZDO() != null)
+                    TrollPieceRegistryHelper.RegisterPieceOnTroll(trollZdo, pieceView.GetZDO().m_uid);
+            }
+            catch { }
+
             Rigidbody trollBody = GetComponent<Rigidbody>();
             if (trollBody != null)
             {
@@ -630,6 +643,31 @@ namespace TrollBuildingMod
             c = null;
             if (string.IsNullOrEmpty(uuid)) return false;
             return s_trolls.TryGetValue(uuid, out c) && c != null;
+        }
+    }
+
+    // Персистентный реестр построек тролля: список ZDOID хранится строкой в
+    // ZDO самого тролля (переживает сохранение). После перезахода кеш
+    // PieceOffsets пуст — VirtualStep восстанавливает его отсюда.
+    public static class TrollPieceRegistryHelper
+    {
+        public static void RegisterPieceOnTroll(ZDO trollZdo, ZDOID pieceId)
+        {
+            if (trollZdo == null || pieceId == ZDOID.None) return;
+            try
+            {
+                string idStr = pieceId.UserID + ":" + pieceId.ID;
+                string list = trollZdo.GetString(TrollBuildConstants.HashPieces, "");
+                foreach (string part in list.Split(';'))
+                    if (part == idStr) return; // уже есть
+
+                list = list.Length > 0 ? list + ";" + idStr : idStr;
+                trollZdo.Set(TrollBuildConstants.HashPieces, list);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[TrollBuild] RegisterPieceOnTroll failed: " + e.Message);
+            }
         }
     }
 
@@ -1919,19 +1957,38 @@ namespace TrollBuildingMod
                 ZDO targetZdo = ZDOMan.instance.GetZDO(targetId);
                 if (targetZdo == null) return true;
 
-                // цель: только ВИДИМЫЙ живой GO, иначе актуальный ZDO
-                ZNetView targetView = null;
                 ZNetView anyView = ZNetScene.instance != null ? ZNetScene.instance.FindInstance(targetZdo) : null;
-                if (anyView != null && anyView.gameObject.activeInHierarchy)
-                    targetView = anyView;
+                bool goVisible = anyView != null && anyView.gameObject.activeInHierarchy;
 
-                Vector3 pos = targetView != null ? targetView.transform.position : targetZdo.GetPosition();
-                Quaternion rot = targetView != null ? targetView.transform.rotation : targetZdo.GetRotation();
+                Vector3 pos = goVisible ? anyView.transform.position : targetZdo.GetPosition();
+                Quaternion rot = goVisible ? anyView.transform.rotation : targetZdo.GetRotation();
 
                 Vector3 exit = pos + rot * Vector3.forward * __instance.m_exitDistance + Vector3.up;
-                ClampToGround(ref exit);
 
-                Debug.Log($"[TrollBuild] Portal teleport start: targetGO={(targetView != null)} exit={exit.ToString("F1")}");
+                if (!goVisible)
+                {
+                    // Предварительная БЕЗОПАСНАЯ точка: на земле, СБОКУ от тролля
+                    // (не «под» ним) — игрок не застрянет в материализующемся GO
+                    ClampToGround(ref exit, 1.5f);
+
+                    string uuid = targetZdo.GetString(TrollBuildConstants.HashTrollUUID, "");
+                    ZDOID trollId = ParseZDOID(uuid);
+                    if (trollId != ZDOID.None)
+                    {
+                        ZDO trollZdo = ZDOMan.instance.GetZDO(trollId);
+                        if (trollZdo != null)
+                        {
+                            Vector3 away = exit - trollZdo.GetPosition();
+                            away.y = 0f;
+                            if (away.sqrMagnitude < 0.01f)
+                                away = rot * Vector3.forward;
+                            exit += away.normalized * 2.5f;
+                            ClampToGround(ref exit, 1.5f);
+                        }
+                    }
+                }
+
+                Debug.Log($"[TrollBuild] Portal teleport start: targetGO={goVisible} exit={exit.ToString("F1")}");
                 player.TeleportTo(exit, rot, true);
 
                 if (TrollWalkManager.Instance != null)
@@ -1947,21 +2004,27 @@ namespace TrollBuildingMod
             }
         }
 
-        private static void ClampToGround(ref Vector3 exit)
+        private static void ClampToGround(ref Vector3 exit, float threshold)
         {
             try
             {
                 float ground = ZoneSystem.instance != null ? ZoneSystem.instance.GetGroundHeight(exit) : 0f;
-                if (ground > 0f && exit.y > ground + 1.5f) exit.y = ground + 1f;
+                if (ground > 0f && exit.y > ground + threshold) exit.y = ground + 1f;
             }
             catch { }
         }
 
+        // ДОВОЗКА: ждём конца ванильного телепорта, затем, пока GO портала
+        // не создан (тролль ещё спавнится) — ПРИДЕРЖИВАЕМ игрока (гасим
+        // скорость: не падает и не скользит), подгружая зону. Когда GO
+        // появился — даём 0.4 с на прикрепление построек (CheckPending в
+        // FixedUpdate) и доставляем игрока к порталу — на уровень платформы,
+        // а не под неё.
         private static IEnumerator DeliverPlayerToPortal(Player player, ZDOID targetId, float exitDistance)
         {
             float deadline = Time.realtimeSinceStartup + 25f;
 
-            // 1) ждём конца телепорта
+            // 1) ждём конца ванильного телепорта
             while (player != null && player && player.IsTeleporting() &&
                    Time.realtimeSinceStartup < deadline)
             {
@@ -1969,7 +2032,7 @@ namespace TrollBuildingMod
             }
             if (player == null || !player) yield break;
 
-            // 2) ждём появления живого ВИДИМОГО GO портала, подгружая зону
+            // 2) ждём появления живого ВИДИМОГО GO портала
             ZNetView targetView = null;
             while (Time.realtimeSinceStartup < deadline)
             {
@@ -1982,6 +2045,13 @@ namespace TrollBuildingMod
                     {
                         targetView = anyView;
                         break;
+                    }
+
+                    // тролля/портала ещё нет — придерживаем игрока на месте
+                    Rigidbody rb = player.GetComponent<Rigidbody>();
+                    if (rb != null && !rb.isKinematic)
+                    {
+                        rb.linearVelocity = Vector3.zero;
                     }
 
                     string uuid = tz.GetString(TrollBuildConstants.HashTrollUUID, "");
@@ -2003,24 +2073,36 @@ namespace TrollBuildingMod
             if (targetView == null)
             {
                 Debug.Log("[TrollBuild] Portal delivery: target GO did not spawn in time");
-                yield break;
+                yield break; // игрок остался на безопасной точке сбоку
             }
 
-            // 3) доставляем к актуальной позиции портала
-            Vector3 pos = targetView.transform.position;
-            Quaternion rot = targetView.transform.rotation;
+            // 3) даём троллю и постройкам время прикрепиться (Attach идёт в
+            //    FixedUpdate контейнера / Start), чтобы портал стоял на месте
+            yield return new WaitForSeconds(0.4f);
+
+            // перепроверяем: GO мог быть снесён
+            ZDO tz2 = ZDOMan.instance.GetZDO(targetId);
+            ZNetView finalView = tz2 != null && ZNetScene.instance != null
+                ? ZNetScene.instance.FindInstance(tz2) : null;
+            if (finalView == null || !finalView.gameObject.activeInHierarchy)
+                yield break;
+
+            // 4) доставляем к порталу — на уровне платформы (порог клампа 6 м:
+            //    платформа ~3.4 м не опускается, «дикий воздух» — опускается)
+            Vector3 pos = finalView.transform.position;
+            Quaternion rot = finalView.transform.rotation;
             Vector3 exit = pos + rot * Vector3.forward * exitDistance + Vector3.up;
-            ClampToGround(ref exit);
+            ClampToGround(ref exit, 6f);
 
             if (player != null && player)
             {
                 player.transform.position = exit;
-                Rigidbody rb = player.GetComponent<Rigidbody>();
-                if (rb != null)
+                Rigidbody rb2 = player.GetComponent<Rigidbody>();
+                if (rb2 != null)
                 {
-                    rb.position = exit;
-                    rb.linearVelocity = Vector3.zero;
-                    rb.angularVelocity = Vector3.zero;
+                    rb2.position = exit;
+                    rb2.linearVelocity = Vector3.zero;
+                    rb2.angularVelocity = Vector3.zero;
                 }
                 if (ZNet.instance != null) ZNet.instance.SetReferencePosition(exit);
                 Debug.Log($"[TrollBuild] Player delivered to portal GO at {exit.ToString("F1")}");
@@ -2044,4 +2126,5 @@ namespace TrollBuildingMod
     }
 
     #endregion
+
 }

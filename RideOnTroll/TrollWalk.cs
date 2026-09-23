@@ -486,6 +486,9 @@ namespace TrollBuildingMod
         //  - GO снесён: чистый виртуал — ZDO тролля + ZDO построек едут вместе
         //    по ЛОКАЛЬНЫМ координатам (HashLocalPos/HashLocalRotQ),
         //    высота платформы учитывается через DefaultBuildRootOffset.
+        //  ПЕРЕЗАХОД: кеш PieceOffsets рантаймовый — при пустом кеше он
+        //  восстанавливается из персистентного реестра построек
+        //  (HashPieces в ZDO тролля + HashLocalPos в ZDO построек).
         // =====================================================================
         private void VirtualStep()
         {
@@ -504,6 +507,11 @@ namespace TrollBuildingMod
                 }
 
                 if (!s_routes.TryGetValue(id, out RouteInfo ri)) { NotifyActive(id); continue; }
+
+                // после перезахода кеш пуст — восстанавливаем из персистентного
+                // реестра (HashPieces в ZDO тролля) и продолжаем печать ZDO построек
+                if (ri.PieceOffsets.Count == 0)
+                    RestorePieceOffsets(zdo, ri);
 
                 Vector3 refPos = ZNet.instance.GetReferencePosition();
                 long owner = zdo.GetOwner();
@@ -564,6 +572,7 @@ namespace TrollBuildingMod
                     zdo.SetPosition(fin);
                     zdo.Set(TrollWalkConstants.HashLastPos, fin);
                     zdo.Set(TrollWalkConstants.HashLastUpdate, ZNet.instance.GetTime().Ticks);
+                    if (ri.PieceOffsets.Count == 0) RestorePieceOffsets(zdo, ri); // страховка
                     MoveVirtualPieces(ri, fin, trollRot);
                     continue;
                 }
@@ -596,6 +605,7 @@ namespace TrollBuildingMod
                 zdo.SetPosition(newPos);
                 zdo.Set(TrollWalkConstants.HashLastPos, newPos);
                 zdo.Set(TrollWalkConstants.HashLastUpdate, ZNet.instance.GetTime().Ticks);
+                if (ri.PieceOffsets.Count == 0) RestorePieceOffsets(zdo, ri); // страховка
                 MoveVirtualPieces(ri, newPos, trollRot);
             }
         }
@@ -666,8 +676,6 @@ namespace TrollBuildingMod
             TrollPiecesContainer cont = inst.GetComponent<TrollPiecesContainer>();
             if (cont == null) return;
 
-            ri.PieceOffsets ??= new List<PieceOffsetData>();
-
             if (cont.AttachedPieces != null)
                 foreach (ZNetView pv in cont.AttachedPieces)
                     AddOrUpdatePieceOffset(ri, pv);
@@ -702,6 +710,68 @@ namespace TrollBuildingMod
                 LocalPos = localPos,
                 LocalRot = localRot
             });
+        }
+
+        // =====================================================================
+        // ВОССТАНОВЛЕНИЕ ПОСЛЕ ПЕРЕЗАХОДА: список ZDOID построек тролля
+        // хранится строкой в ZDO самого тролля (HashPieces — пишется в
+        // RegisterPiece), локальные координаты — в ZDO построек
+        // (HashLocalPos/HashLocalRotQ). Кеш рантаймовый и после загрузки
+        // пуст — восстанавливаем и печать продолжается.
+        // =====================================================================
+        internal void RestorePieceOffsets(ZDO zdo, RouteInfo ri)
+        {
+            if (ri == null || ri.PieceOffsets.Count > 0) return;
+            try
+            {
+                string list = zdo.GetString(TrollBuildConstants.HashPieces, "");
+                if (string.IsNullOrEmpty(list)) return;
+
+                foreach (string part in list.Split(';'))
+                {
+                    ZDOID id = ParseZDOID(part);
+                    if (id == ZDOID.None) continue;
+                    ZDO pz = ZDOMan.instance.GetZDO(id);
+                    if (pz == null || pz.m_uid == ZDOID.None || !pz.IsValid()) continue;
+
+                    Vector3 lp = pz.GetVec3(TrollBuildConstants.HashLocalPos, Vector3.zero);
+                    Quaternion lr = pz.GetQuaternion(TrollBuildConstants.HashLocalRotQ, Quaternion.identity);
+
+                    bool exists = false;
+                    foreach (PieceOffsetData d in ri.PieceOffsets)
+                        if (d.Zdo.m_uid == pz.m_uid) { exists = true; break; }
+                    if (exists) continue;
+
+                    ri.PieceOffsets.Add(new PieceOffsetData
+                    {
+                        Zdo = pz,
+                        LocalPos = lp,
+                        LocalRot = lr
+                    });
+                }
+
+                if (ri.PieceOffsets.Count > 0)
+                    Debug.Log($"[TrollWalk] Restored {ri.PieceOffsets.Count} piece offsets from troll ZDO (post-load)");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[TrollWalk] RestorePieceOffsets failed: " + e.Message);
+            }
+        }
+
+        internal static ZDOID ParseZDOID(string s)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(s)) return ZDOID.None;
+                string[] parts = s.Split(':');
+                if (parts.Length == 2 &&
+                    long.TryParse(parts[0], out long user) &&
+                    uint.TryParse(parts[1], out uint id))
+                    return new ZDOID(user, id);
+            }
+            catch { }
+            return ZDOID.None;
         }
 
         private void BackgroundScan()
