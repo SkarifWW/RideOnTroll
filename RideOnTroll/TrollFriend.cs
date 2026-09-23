@@ -13,7 +13,7 @@ namespace TrollTamerMod
     {
         public const string PluginGUID = "com.custom.trolltamer";
         public const string PluginName = "TrollTamer";
-        public const string PluginVersion = "1.5.1";
+        public const string PluginVersion = "1.6.0";
 
         private Harmony _harmony;
 
@@ -207,12 +207,9 @@ namespace TrollTamerMod
         }
     }
 
-    // Хил от еды: в этой версии игры Tameable НЕ кормит из рук — тролль
-    // подбирает еду с земли (MonsterAI.m_consumeItems), а мы лечим его
-    // в момент подбора (+15% макс. HP за кусок оленины).
     // Хил от еды: ванильный подбор еды может не сработать (m_tamable у MonsterAI
     // заполняется в BaseAI.Awake раньше, чем мы добавляем Tameable троллю),
-    // поэтому ищем и съедаем мясо сами: находим сырую оленину в радиусе,
+    // поэтому ищем и съедаем мясо сами: находим оленину в радиусе,
     // ведём тролля к ней (BaseAI.MoveTo), съедаем, лечим и сбрасываем голод.
     // Ест, когда голоден ИЛИ когда ранен (HP < 50%).
     public class TrollFoodHealer : MonoBehaviour
@@ -221,6 +218,8 @@ namespace TrollTamerMod
         private MonsterAI m_ai;
         private ZNetView m_nview;
         private ItemDrop m_target;
+
+        public bool HasFoodTarget => m_target != null;
 
         private static readonly MethodInfo s_moveTo = AccessTools.Method(typeof(BaseAI), "MoveTo");
         private static readonly int s_itemMask = LayerMask.GetMask("item");
@@ -241,7 +240,7 @@ namespace TrollTamerMod
         private void FixedUpdate()
         {
             try { Tick(Time.fixedDeltaTime); }
-            catch { }
+            catch (Exception e) { Debug.LogWarning("[TrollTamer] Feeder tick failed: " + e.Message); }
         }
 
         private void Tick(float dt)
@@ -251,9 +250,9 @@ namespace TrollTamerMod
             if (m_character.IsDead() || !m_character.IsTamed()) return;
 
             ZDO zdo = m_nview.GetZDO();
-            if (zdo.GetBool(TrollWalkConstants.HashActive, false)) return;
-            if (zdo.GetBool(TrollTamePatches.ZDO_FREEZE_KEY, false)) return;
-            if (m_ai.GetTargetCreature() != null) return;
+            if (zdo.GetBool(TrollWalkConstants.HashActive, false)) return; // в маршруте
+            if (zdo.GetBool(TrollTamePatches.ZDO_FREEZE_KEY, false)) return; // заморожен
+            if (m_ai.GetTargetCreature() != null) return; // в бою
 
             bool hungry = IsHungry(zdo);
             bool hurt = m_character.GetHealth() < m_character.GetMaxHealth() * 0.5f;
@@ -264,8 +263,6 @@ namespace TrollTamerMod
             {
                 m_searchTimer = 0f;
                 m_target = FindClosestMeat();
-                if (m_target != null)
-                    Debug.Log($"[TrollTamer] Troll found food: {m_target.name} at {m_target.transform.position}");
             }
 
             if (m_target == null) return;
@@ -281,7 +278,6 @@ namespace TrollTamerMod
             Eat(m_target);
             m_target = null;
         }
-
 
         private bool IsHungry(ZDO zdo)
         {
@@ -310,13 +306,10 @@ namespace TrollTamerMod
                 float d = Vector3.Distance(center, drop.transform.position);
                 if (d < bestDist) { bestDist = d; best = drop; }
             }
-            if (best == null && Time.time % 5f < 0.1f)
-                Debug.Log("[TrollTamer] No meat found nearby (item name sample: " +
-                          (n > 0 && s_buffer[0] != null && s_buffer[0].attachedRigidbody != null
-                              ? s_buffer[0].attachedRigidbody.name : "none") + ")");
             return best;
         }
 
+        // Матчинг по имени префаба GO ("DeerMeat(Clone)") — не зависит от локализации
         private static bool IsMeat(ItemDrop drop)
         {
             string goName = drop.gameObject.name;
@@ -344,6 +337,7 @@ namespace TrollTamerMod
                 closest.Message(MessageHud.MessageType.TopLeft, $"{m_character.m_name} подкрепился и восстановил силы", 0, null, false);
         }
 
+        // Character.Heal через рефлексию (сигнатура могла меняться между версиями)
         private static void HealCharacter(Character c, float amount)
         {
             try
@@ -409,9 +403,8 @@ namespace TrollTamerMod
             tame.m_fedDuration = 1800f;
             tame.m_tamingTime = 60f;
 
-            // РАЗМНОЖЕНИЕ: в этой версии игры им управляет компонент Procreation
-            // (Tameable.SpawnChild не существует). Сносим его у троллей —
-            // жёсткая гарантия отсутствия детёнышей.
+            // РАЗМНОЖЕНИЕ: в этой версии игры им управляет компонент Procreation.
+            // Сносим его у троллей — жёсткая гарантия отсутствия детёнышей.
             Procreation procreation = go.GetComponent<Procreation>();
             if (procreation != null) UnityEngine.Object.Destroy(procreation);
 
@@ -425,33 +418,48 @@ namespace TrollTamerMod
             }
         }
 
-        // Кормление: RawMeat в MonsterAI.m_consumeItems + хил на поедание.
+        // Кормление: оленина в MonsterAI.m_consumeItems + хил на поедание.
         // Вызывается при загрузке приручённого тролля и в момент приручения.
         public static void AddTrollFood(GameObject go)
         {
             try
             {
+                // префабы (без ZDO) — пропускаем: IsTamed на них невалиден (NRE)
+                ZNetView nv = go.GetComponent<ZNetView>();
+                if (nv == null || nv.GetZDO() == null) return;
+
                 Character c = go.GetComponent<Character>();
                 if (c == null || !c.IsTamed()) return; // только приручённые
 
                 MonsterAI ai = go.GetComponent<MonsterAI>();
                 if (ai == null) return;
 
-                GameObject meatPrefab = ObjectDB.instance != null ? ObjectDB.instance.GetItemPrefab("RawMeat") : null;
-                ItemDrop meat = meatPrefab != null ? meatPrefab.GetComponent<ItemDrop>() : null;
-                if (meat == null)
+                string meatName = MeatItemName;
+                GameObject meatPrefab = null;
+                foreach (string prefabName in new[] { "DeerMeat", "RawMeat" })
                 {
-                    Debug.LogWarning("[TrollTamer] RawMeat prefab not found — feeding disabled");
-                    return;
+                    GameObject p = ObjectDB.instance != null ? ObjectDB.instance.GetItemPrefab(prefabName) : null;
+                    if (p != null) { meatPrefab = p; break; }
                 }
 
-                if (ai.m_consumeItems == null) ai.m_consumeItems = new List<ItemDrop>();
-                if (!ai.m_consumeItems.Contains(meat)) ai.m_consumeItems.Add(meat);
+                if (meatPrefab == null)
+                {
+                    Debug.LogWarning("[TrollTamer] Meat prefab not found (DeerMeat/RawMeat) — vanilla consumption disabled, feeder still active");
+                }
+                else
+                {
+                    ItemDrop meat = meatPrefab.GetComponent<ItemDrop>();
+                    if (meat != null)
+                    {
+                        if (ai.m_consumeItems == null) ai.m_consumeItems = new List<ItemDrop>();
+                        if (!ai.m_consumeItems.Contains(meat)) ai.m_consumeItems.Add(meat);
+                    }
+                }
 
                 if (go.GetComponent<TrollFoodHealer>() == null)
                     go.AddComponent<TrollFoodHealer>();
 
-                Debug.Log("[TrollTamer] Feeding enabled for tamed troll (RawMeat)");
+                Debug.Log("[TrollTamer] Feeding enabled for tamed troll (" + meatName + ")");
             }
             catch (Exception e)
             {
@@ -461,7 +469,7 @@ namespace TrollTamerMod
 
         private static string s_meatItemName;
 
-        // Имя предмета еды (сравнивается по m_shared.m_name дропнутых предметов)
+        // Имя предмета еды (для сравнения по токену; первичный матчинг — по GO-имени)
         public static string MeatItemName
         {
             get
@@ -470,7 +478,7 @@ namespace TrollTamerMod
                 {
                     try
                     {
-                        foreach (string prefabName in new[] { "RawMeat", "DeerMeat" })
+                        foreach (string prefabName in new[] { "DeerMeat", "RawMeat" })
                         {
                             GameObject p = ObjectDB.instance != null ? ObjectDB.instance.GetItemPrefab(prefabName) : null;
                             ItemDrop d = p != null ? p.GetComponent<ItemDrop>() : null;
@@ -481,9 +489,9 @@ namespace TrollTamerMod
                                 break;
                             }
                         }
-                        if (s_meatItemName == null) s_meatItemName = "$item_rawmeat";
+                        if (s_meatItemName == null) s_meatItemName = "$item_deer_meat";
                     }
-                    catch { s_meatItemName = "$item_rawmeat"; }
+                    catch { s_meatItemName = "$item_deer_meat"; }
                 }
                 return s_meatItemName;
             }
@@ -694,18 +702,13 @@ namespace TrollTamerMod
     }
 
     // Страховка размножения: у троллей Procreation снесён (см. SetupTrollComponents),
-    // этот патч дополнительно глушит spawn-метод Procreation, если компонент
-    // каким-то образом окажется на тролле (мод/консоль).
-    // Страховка размножения: у троллей Procreation снесён (см. SetupTrollComponents),
     // этот патч дополнительно глушит Procreation.Procreate(), если компонент
     // каким-то образом окажется на тролле (мод/консоль/обновление игры).
-    // Сверено с Procreation.cs: размножение выполняется в private void Procreate().
     [HarmonyPatch]
     public static class ProcreationNoBreed_Patch
     {
         private static MethodBase TargetMethod()
         {
-            // основной кандидат — точное имя из ванили
             MethodBase m = AccessTools.Method(typeof(Procreation), "Procreate");
             if (m != null)
             {
@@ -713,7 +716,6 @@ namespace TrollTamerMod
                 return m;
             }
 
-            // фолбэк: любой метод Procreation без параметров с «Procreat»/«Spawn» в имени
             foreach (MethodInfo mi in typeof(Procreation).GetMethods(AccessTools.all))
             {
                 if (mi.DeclaringType != typeof(Procreation)) continue;

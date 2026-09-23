@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -323,8 +324,42 @@ namespace TrollBuildingMod
 
             if (!m_attachedPieces.Contains(pieceView)) m_attachedPieces.Add(pieceView);
 
-            foreach (MeshCollider mc in pieceView.GetComponentsInChildren<MeshCollider>(true))
-                if (!mc.convex) mc.convex = true;
+            // ПОРТАЛ: отключаем родной MeshCollider (он при convex закрывает проём арки монолитом)
+            // и ставим открытую рамку из 3 BoxCollider (левый столб, правый столб, балка), как в BuildOnShip
+            if (pieceView.GetComponent<TeleportWorld>() != null)
+            {
+                foreach (MeshCollider mc in pieceView.GetComponentsInChildren<MeshCollider>(true))
+                {
+                    mc.enabled = false;
+                }
+
+                Transform existingFrame = pieceView.transform.Find("_PortalFrameColliders");
+                if (existingFrame == null)
+                {
+                    GameObject frameObj = new GameObject("_PortalFrameColliders");
+                    frameObj.transform.SetParent(pieceView.transform, false);
+                    frameObj.layer = pieceView.gameObject.layer;
+
+                    BoxCollider leftPost = frameObj.AddComponent<BoxCollider>();
+                    leftPost.center = new Vector3(-0.75f, 1.2f, 0f);
+                    leftPost.size = new Vector3(0.45f, 2.4f, 0.5f);
+
+                    BoxCollider rightPost = frameObj.AddComponent<BoxCollider>();
+                    rightPost.center = new Vector3(0.75f, 1.2f, 0f);
+                    rightPost.size = new Vector3(0.45f, 2.4f, 0.5f);
+
+                    BoxCollider topBar = frameObj.AddComponent<BoxCollider>();
+                    topBar.center = new Vector3(0f, 2.5f, 0f);
+                    topBar.size = new Vector3(1.9f, 0.5f, 0.5f);
+                }
+            }
+            else
+            {
+                foreach (MeshCollider mc in pieceView.GetComponentsInChildren<MeshCollider>(true))
+                {
+                    if (!mc.convex) mc.convex = true;
+                }
+            }
 
             pieceView.transform.SetParent(m_buildRoot, false);
             pieceView.transform.localPosition = localPos;
@@ -373,9 +408,10 @@ namespace TrollBuildingMod
 
             if (pieceView.GetZDO() != null)
             {
-                TrollPieceZdoHelper.MovePieceZDO(pieceView.GetZDO(), pieceView.transform.position);
-                pieceView.GetZDO().SetRotation(pieceView.transform.rotation);
+                TrollPieceZdoHelper.MovePieceZDO(pieceView.GetZDO(), pieceView.transform.position, pieceView.transform.rotation);
             }
+
+            Debug.Log($"[TrollBuild] Piece '{pieceView.gameObject.name}' registered on troll {TrollUUID}, worldPos={pieceView.transform.position.ToString("F1")}");
 
             RecheckAllPiecesSupport(false);
         }
@@ -500,8 +536,7 @@ namespace TrollBuildingMod
                     Quaternion curRot = piece.transform.rotation;
                     if ((piece.GetZDO().GetPosition() - curPos).sqrMagnitude > 0.001f)
                     {
-                        TrollPieceZdoHelper.MovePieceZDO(piece.GetZDO(), curPos);
-                        piece.GetZDO().SetRotation(curRot);
+                        TrollPieceZdoHelper.MovePieceZDO(piece.GetZDO(), curPos, curRot);
                     }
                 }
             }
@@ -609,11 +644,10 @@ namespace TrollBuildingMod
             if (!s_pending.TryGetValue(uuid, out var list)) { list = new List<ZNetView>(); s_pending[uuid] = list; }
             if (!list.Contains(v)) list.Add(v);
 
-            // НОСИТЕЛЬ НЕ ЗАГРУЖЕН: GO постройки прячем — иначе он «осиротеет»:
-            // ZDO едет с троллём, а мёртвый GO (ZSyncTransform выключен) остаётся
-            // стоять в поле — именно к нему ваниль телепортировала игроков.
-            // Оживим при Attach, когда тролль загрузится.
+            // НОСИТЕЛЬ НЕ ЗАГРУЖЕН: GO постройки прячем — иначе он «осиротеет»
             try { if (v.gameObject.activeSelf) v.gameObject.SetActive(false); } catch { }
+
+            Debug.Log($"[TrollBuild] Piece '{v.gameObject.name}' waiting for troll {uuid} — GO hidden at {v.transform.position.ToString("F1")}");
         }
 
         public static bool HasPending(string uuid)
@@ -626,7 +660,6 @@ namespace TrollBuildingMod
             if (!string.IsNullOrEmpty(uuid)) s_pending.Remove(uuid);
         }
 
-        // Забрать (и очистить) очередь ждущих привязки GO для тролля
         public static List<ZNetView> TakePending(string uuid)
         {
             if (string.IsNullOrEmpty(uuid)) return null;
@@ -638,7 +671,6 @@ namespace TrollBuildingMod
             return null;
         }
 
-        // Посмотреть очередь ждущих привязки (не забирая)
         public static List<ZNetView> GetPendingViews(string uuid)
         {
             if (string.IsNullOrEmpty(uuid)) return null;
@@ -654,6 +686,7 @@ namespace TrollBuildingMod
                 var v = list[i];
                 if (v == null || !v.IsValid()) { list.RemoveAt(i); continue; }
                 Attach(container, v);
+                Debug.Log($"[TrollBuild] Pending piece attached: '{v.gameObject.name}' -> troll {uuid}");
                 list.RemoveAt(i);
             }
             if (list.Count == 0) s_pending.Remove(uuid);
@@ -934,11 +967,8 @@ namespace TrollBuildingMod
             s_lastZoneRejectLog = Time.time;
             Vector3 local = troll.transform.InverseTransformPoint(worldPoint);
             Debug.Log($"[TrollBuild] Troll hit OUTSIDE build zone: troll-local point = {local.ToString("F2")}. " +
-                      $"Zone offset = {TrollBuildConstants.DefaultBuildRootOffset}, half-extents = {TrollBuildConstants.BuildZoneHalfExtents}. " +
                       "If this repeats where you want to build — tune these constants.");
         }
-
-        // ============ Гашение флагов ghost (в кадре валидации) ============
 
         private struct GhostFlags
         {
@@ -1001,8 +1031,6 @@ namespace TrollBuildingMod
             s_flagsPiece = null;
         }
 
-        // ============ Контейнер на тролле ============
-
         [HarmonyPatch(typeof(Character), "Awake")]
         [HarmonyPostfix]
         private static void Character_Awake_Postfix(Character __instance)
@@ -1011,11 +1039,6 @@ namespace TrollBuildingMod
             if (__instance.GetComponent<TrollPiecesContainer>() == null)
                 __instance.gameObject.AddComponent<TrollPiecesContainer>();
         }
-
-        // =========================================================================
-        // PieceRayTest — ПОЛНАЯ ЗАМЕНА (выполняется последним благодаря низкому
-        // приоритету; реплика ванили + корабли BuildOnShip + тролли)
-        // =========================================================================
 
         [HarmonyPatch(typeof(Player), "PieceRayTest")]
         [HarmonyPrefix]
@@ -1073,7 +1096,6 @@ namespace TrollBuildingMod
                 Collider col = hit.collider;
                 if (col == null) continue;
 
-                // --- 1. Деталь, стоящая на тролле ---
                 TrollPieceTag tag = col.GetComponentInParent<TrollPieceTag>();
                 if (tag != null && tag.Container != null)
                 {
@@ -1095,10 +1117,9 @@ namespace TrollBuildingMod
 
                 bool isCharacterLayer = (characterMask & (1 << col.gameObject.layer)) != 0;
 
-                // --- 2. Слои персонажей: для ванили прозрачны; троллей перехватываем ---
                 if (isCharacterLayer)
                 {
-                    if (col.GetComponentInParent<Player>() != null) continue; // капсулы игроков
+                    if (col.GetComponentInParent<Player>() != null) continue;
 
                     if (Vector3.Distance(eyePos, hit.point) <= trollMaxDist)
                     {
@@ -1114,7 +1135,6 @@ namespace TrollBuildingMod
                                 container.EnsureBuildRoot();
                                 Transform root = container.BuildRoot;
 
-                                // клэмп точки прицеливания в реальную зону
                                 Vector3 lp = root.InverseTransformPoint(hit.point);
                                 Vector3 he = TrollBuildConstants.BuildZoneHalfExtents;
                                 lp.x = Mathf.Clamp(lp.x, -he.x, he.x);
@@ -1137,13 +1157,12 @@ namespace TrollBuildingMod
                             LogZoneReject(ch, hit.point);
                         }
                     }
-                    continue; // прочие персонажи — прозрачны, как в ванили
+                    continue;
                 }
 
-                // --- 3. Первый «видимый ванили» хит ---
                 if (Vector3.Distance(eyePos, hit.point) > vanillaMaxDist) return false;
 
-                Ship ship = col.GetComponentInParent<Ship>(); // совместимость с BuildOnShip
+                Ship ship = col.GetComponentInParent<Ship>();
                 if (col.attachedRigidbody != null && ship == null) return false;
 
                 point = hit.point;
@@ -1155,10 +1174,8 @@ namespace TrollBuildingMod
                 return false;
             }
 
-            return false; // ничего подходящего — NoRayHits, как в ванили
+            return false;
         }
-
-        // ============ Авторитетное позиционирование ghost ============
 
         private static Vector3 s_lockedLocalPos = Vector3.zero;
         private static TrollPiecesContainer s_lockContainer;
@@ -1199,12 +1216,10 @@ namespace TrollBuildingMod
             float rotDeg = PlaceRotationDegreesRef(__instance);
             int snapIndex = ManualSnapPointRef(__instance);
 
-            // --- ВРАЩЕНИЕ: напрямую из m_placeRotation ---
             Quaternion localYaw = Quaternion.Euler(0f, rotDeg * placeRotation, 0f);
             Quaternion ghostRot = root.rotation * localYaw;
             ghost.transform.rotation = ghostRot;
 
-            // --- ПОЗИЦИЯ: drop + snap от точки прицеливания ---
             Vector3 aim = TrollBuildContext.AimPoint;
             Vector3 lift = TrollBuildContext.AimNormal;
             try
@@ -1290,7 +1305,6 @@ namespace TrollBuildingMod
             }
             catch { }
 
-            // --- ЛОК позиции (в координатах BuildRoot) ---
             Vector2 mouseDelta = ZInput.GetMouseDelta();
             bool aimInput = mouseDelta.sqrMagnitude > 0.0001f
                 || Mathf.Abs(ZInput.GetJoyRightStickX()) > 0.05f
@@ -1317,7 +1331,6 @@ namespace TrollBuildingMod
             ghost.transform.position = root.TransformPoint(s_lockedLocalPos);
             ghost.transform.rotation = ghostRot;
 
-            // --- Статус ---
             if (TrollBuildContext.TargetType == TrollBuildTargetType.TrollPiece && TrollBuildContext.TargetPiece != null)
             {
                 WearNTear targetWnt = TrollBuildContext.TargetPiece.GetComponent<WearNTear>();
@@ -1340,8 +1353,6 @@ namespace TrollBuildingMod
             }
         }
 
-        // ============ Байпас клиппинга ============
-
         [HarmonyPatch(typeof(Player), "TestGhostClipping")]
         [HarmonyPrefix]
         private static bool TestGhostClipping_Prefix(ref bool __result)
@@ -1354,8 +1365,6 @@ namespace TrollBuildingMod
             return true;
         }
 
-        // ============ Снап-сетка спины ============
-
         [HarmonyPatch(typeof(Piece), "GetSnapPoints",
             new[] { typeof(Vector3), typeof(float), typeof(List<Transform>), typeof(List<Piece>) })]
         [HarmonyPostfix]
@@ -1367,8 +1376,6 @@ namespace TrollBuildingMod
             if (container == null || container.DeckSnapPoints.Count == 0) return;
             points.AddRange(container.DeckSnapPoints);
         }
-
-        // ============ Ховер: постройки важнее тролля ============
 
         [HarmonyPatch(typeof(Player), "FindHoverObject")]
         [HarmonyPostfix]
@@ -1420,8 +1427,6 @@ namespace TrollBuildingMod
             }
             return null;
         }
-
-        // ============ Привязка после постановки ============
 
         [HarmonyPatch(typeof(Player), "PlacePiece")]
         [HarmonyPostfix]
@@ -1486,7 +1491,6 @@ namespace TrollBuildingMod
                     }
 
                     container.RegisterPiece(nview, localPos, localRot);
-                    Debug.Log($"[TrollBuild] Attached '{placed.gameObject.name}' to troll {container.TrollUUID}, localPos={localPos.ToString("F2")}");
                 }
             }
 
@@ -1494,8 +1498,6 @@ namespace TrollBuildingMod
             s_hasLockedPosition = false;
             s_lockContainer = null;
         }
-
-        // ============ Износ/поддержка ============
 
         [HarmonyPatch(typeof(WearNTear), "UpdateSupport")]
         [HarmonyPrefix]
@@ -1520,8 +1522,6 @@ namespace TrollBuildingMod
             if (tag != null && tag.Container != null)
                 tag.Container.OnPieceDestroyed(__instance);
         }
-
-        // ============ Сеть / загрузка ============
 
         [HarmonyPatch(typeof(ZSyncTransform), "ClientSync")]
         [HarmonyPrefix]
@@ -1548,8 +1548,6 @@ namespace TrollBuildingMod
             else
                 TrollPieceAttachmentQueue.Enqueue(trollUUID, __instance);
         }
-
-        // ============ Перенос игрока (glue: ходьба + анимация) ============
 
         [HarmonyPatch(typeof(Character), "ApplyGroundForce")]
         [HarmonyPrefix]
@@ -1614,8 +1612,6 @@ namespace TrollBuildingMod
             return false;
         }
 
-        // ============ Ограничение скорости поворота тролля с постройками ============
-
         [HarmonyPatch(typeof(Character), "UpdateRotation")]
         [HarmonyPrefix]
         private static void Character_UpdateRotation_Prefix(Character __instance, ref float turnSpeed)
@@ -1632,17 +1628,6 @@ namespace TrollBuildingMod
 
     #region Полный игнор урона от троллей по постройкам на троллях
 
-    // =====================================================================
-    // Любой урон, источник которого — ТРОЛЛЬ (любой: сам носитель, чужой
-    // приручённый, дикий), ПОЛНОСТЬЮ игнорируется, если цель — постройка,
-    // закреплённая на тролле (TrollPieceTag + живой контейнер).
-    // Проходит как в ванили: урон от игроков, врагов, погоды; удары
-    // троллей по обычным (не тролльим) постройкам; снятие построек
-    // молотом (Remove/RPC_Remove — не через Damage).
-    // Перехватываем Damage (вход IDestructible) и RPC_Damage (применение
-    // урона у владельца) — блокируется и урон, и цифры, и эффекты удара.
-    // =====================================================================
-
     internal static class TrollPieceDamageFilter
     {
         private static float s_lastLog = -10f;
@@ -1658,12 +1643,9 @@ namespace TrollBuildingMod
             {
                 if (wnt == null || hit == null) return false;
 
-                // Цель — постройка, закреплённая на тролле?
-                // (Container == null => постройка отвалилась — урон снова проходит)
                 TrollPieceTag tag = wnt.GetComponent<TrollPieceTag>();
                 if (tag == null || tag.Container == null) return false;
 
-                // Источник удара — тролль? (любой, не только носитель)
                 Character attacker = hit.GetAttacker();
                 if (!IsTroll(attacker)) return false;
 
@@ -1701,24 +1683,10 @@ namespace TrollBuildingMod
 
     #endregion
 
-    #region Движение ZDO построек тролля (спец-обработка порталов) + чистка зомби-ZDO
+    #region Движение ZDO построек тролля (порталы — только m_portalObjects) + чистка
 
-    // =====================================================================
-    // ПОРТАЛЫ. Ваниль запирает порталам переселение между секторами
-    // (ZDO.SetSector: Game.instance.PortalPrefabHash -> ранний return).
-    // Обычный SetPosition уводит ПОЗИЦИЮ, но ZDO остаётся в СТАРОМ секторе.
-    // При разрушении портала DestroyZDO ищет его в секторе «по позиции» —
-    // не находит: ZDO Reset-ится (uid 0:0, prefab -1) и ОСТАЁТСЯ в старом
-    // секторе навсегда -> CreateObjects каждые 0.03 с спамит
-    // "Missing prefab hash: -1 / Destroyed invalid prefab ZDO:0:0".
-    // Порталы переселяются вручную (+ перегруппировка портального реестра
-    // ZDOMan.GetPortals — по нему порталы ищут пару по имени), а зомби-ZDO
-    // вычищаются из секторов.
-    // =====================================================================
     public static class TrollPieceZdoHelper
     {
-        private static readonly MethodInfo s_addToSector = AccessTools.Method(typeof(ZDOMan), "AddToSector");
-        private static readonly MethodInfo s_removeFromSector = AccessTools.Method(typeof(ZDOMan), "RemoveFromSector");
         private static FieldInfo s_sectorDict;
 
         public static bool IsPortalPrefab(GameObject prefab)
@@ -1730,82 +1698,72 @@ namespace TrollBuildingMod
         {
             try
             {
-                if (zdo == null || zdo.GetPrefab() <= 0 || ZNetScene.instance == null) return false;
+                if (zdo == null) return false;
+                // Первично — ванильный список порталов (надёжен и без ZNetScene)
+                if (Game.instance != null && Game.instance.PortalPrefabHash != null)
+                    return Game.instance.PortalPrefabHash.Contains(zdo.GetPrefab());
+                if (ZNetScene.instance == null) return false;
                 return IsPortalPrefab(ZNetScene.instance.GetPrefab(zdo.GetPrefab()));
             }
             catch { return false; }
         }
 
-        // Двигаем ZDO постройки тролля. Для обычных построек — SetPosition,
-        // для порталов — с ручным переселением сектора И перегруппировкой
-        // портального реестра ZDOMan.GetPortals() (по нему порталы ищут пару
-        // по имени; без этого портал «залипает» в старом секторе реестра и
-        // выпадает из сети порталов — «исчезает», связи не образуются).
-        public static void MovePieceZDO(ZDO zdo, Vector3 pos)
+        // Перенос ZDO постройки тролля. Сервер забирает владение (иначе
+        // SetPosition не инкрементирует DataRevision — клиент не узнает о
+        // новой позиции). Порталы: только m_portalObjects (ваниль сама
+        // добавляет их в FindObjects — AddToSector даст ДУБЛИКАТ GO!).
+        public static void MovePieceZDO(ZDO zdo, Vector3 pos, Quaternion rot)
         {
-            if (zdo == null) return;
+            if (zdo == null || ZDOMan.instance == null) return;
             try
             {
+                if (ZNet.instance != null && ZNet.instance.IsServer() && !zdo.IsOwner())
+                    zdo.SetOwner(ZDOMan.GetSessionID());
+
                 if (!IsPortalZDO(zdo))
                 {
                     zdo.SetPosition(pos);
+                    zdo.SetRotation(rot);
                     return;
                 }
 
+                // ПОРТАЛ
                 ZoneSystem.SectorIndex oldSector = zdo.GetSectorIndex();
-                zdo.SetPosition(pos); // для портала SetSector — no-op, позиция обновится
-                ZoneSystem.SectorIndex newSector = zdo.GetSectorIndex();
-                if (oldSector.Equals(newSector)) return;
+                ZoneSystem.SectorIndex newSector = ZoneSystem.GetSectorIndex(pos);
 
-                // 1) общий сектор-словарь (создание/выгрузка GO)
-                if (s_removeFromSector != null)
-                    s_removeFromSector.Invoke(ZDOMan.instance, new object[] { zdo, oldSector });
-                if (s_addToSector != null)
-                    s_addToSector.Invoke(ZDOMan.instance, new object[] { zdo, newSector });
+                zdo.SetPosition(pos);
+                zdo.SetRotation(rot);
+                ZDOMan.instance.SetDirtyPortals(); // помечаем грязным на любой сдвиг
 
-                // 2) портальный реестр (та же схема, что ZDO_PortalRekey_Patch у BuildOnShip,
-                //    но своя — не зависим от того, установлен ли его мод)
-                try
+                if (!oldSector.Equals(newSector))
                 {
-                    var portals = ZDOMan.instance.GetPortals();
-                    if (portals != null)
+                    try
                     {
-                        bool wasElsewhere = false;
-                        bool inNewList = false;
-                        List<ZoneSystem.SectorIndex> emptied = null;
-                        foreach (var kv in portals)
+                        var portals = ZDOMan.instance.GetPortals();
+                        if (portals != null)
                         {
-                            if (kv.Key.Equals(newSector))
+                            if (portals.TryGetValue(oldSector, out List<ZDO> oldList))
                             {
-                                if (kv.Value != null && kv.Value.Contains(zdo)) inNewList = true;
-                                continue;
+                                oldList.Remove(zdo);
+                                if (oldList.Count == 0) portals.Remove(oldSector);
                             }
-                            if (kv.Value != null && kv.Value.Remove(zdo))
-                            {
-                                wasElsewhere = true;
-                                if (kv.Value.Count == 0) (emptied ??= new List<ZoneSystem.SectorIndex>()).Add(kv.Key);
-                            }
-                        }
-                        if (emptied != null)
-                            for (int i = 0; i < emptied.Count; i++) portals.Remove(emptied[i]);
 
-                        if (wasElsewhere && !inNewList)
-                        {
-                            if (!portals.TryGetValue(newSector, out var list))
+                            if (!portals.TryGetValue(newSector, out List<ZDO> newList))
                             {
-                                list = new List<ZDO>();
-                                portals[newSector] = list;
+                                newList = new List<ZDO>();
+                                portals[newSector] = newList;
                             }
-                            list.Add(zdo);
+                            if (!newList.Contains(zdo))
+                                newList.Add(zdo);
                         }
-
-                        ZDOMan.instance.SetDirtyPortals();
                     }
-                }
-                catch (Exception e) { Debug.LogWarning("[TrollBuild] Portal rekey failed: " + e.Message); }
+                    catch (Exception e) { Debug.LogWarning("[TrollBuild] Portal rekey failed: " + e.Message); }
 
-                if (ZNet.instance != null && ZNet.instance.IsServer())
-                    ZDOMan.instance.ZDOSectorInvalidated(zdo);
+                    if (ZNet.instance != null && ZNet.instance.IsServer())
+                        ZDOMan.instance.ZDOSectorInvalidated(zdo);
+
+                    Debug.Log($"[TrollBuild] Portal ZDO {zdo.m_uid} resector {oldSector.Sector} -> {newSector.Sector} pos={pos.ToString("F1")}");
+                }
             }
             catch (Exception e)
             {
@@ -1813,8 +1771,6 @@ namespace TrollBuildingMod
             }
         }
 
-        // Чистка «мёртвых» ZDO (uid 0:0, prefab -1), застрявших в секторах, —
-        // лечит миры, уже испорченные сломанным порталом на тролле.
         public static void PurgeZombieZDO(ZDO zdo)
         {
             try
@@ -1849,8 +1805,6 @@ namespace TrollBuildingMod
             }
         }
 
-        // Словарь «сектор -> коллекция ZDO» ищем по типу (имя поля могло
-        // поменяться между версиями игры)
         private static FieldInfo FindSectorDict()
         {
             foreach (FieldInfo f in typeof(ZDOMan).GetFields(AccessTools.all))
@@ -1864,8 +1818,6 @@ namespace TrollBuildingMod
         }
     }
 
-    // Перехват создания объектов: зомби-ZDO (0:0 / prefab -1) не создаём,
-    // а вычищаем из секторов — разрывает спам-цикл навсегда
     [HarmonyPatch]
     public static class TrollZombieZdoCleanup
     {
@@ -1883,6 +1835,211 @@ namespace TrollBuildingMod
             }
             __result = null;
             return false;
+        }
+    }
+
+    // Дети GO тролля уничтожаются вместе с родителем; если их собственный
+    // earmark не попал в выборку RemoveObjects — запись «зависает» с мёртвым
+    // ZNetView, Created остаётся true и GO НИКОГДА не пересоздаётся.
+    [HarmonyPatch]
+    public static class TrollStuckZdoCleanup
+    {
+        private static readonly AccessTools.FieldRef<ZNetScene, Dictionary<ZDO, ZNetView>> s_instancesField =
+            AccessTools.FieldRefAccess<ZNetScene, Dictionary<ZDO, ZNetView>>("m_instances");
+
+        [HarmonyPatch(typeof(ZNetScene), "RemoveObjects")]
+        [HarmonyPostfix]
+        private static void RemoveObjects_Postfix(ZNetScene __instance)
+        {
+            try
+            {
+                var instances = s_instancesField(__instance);
+                if (instances == null || instances.Count == 0) return;
+
+                List<ZDO> deadKeys = null;
+                foreach (var kvp in instances)
+                {
+                    if (kvp.Value != null) continue; // живой — не трогаем
+                    (deadKeys ??= new List<ZDO>()).Add(kvp.Key);
+                }
+                if (deadKeys == null) return;
+
+                foreach (ZDO zdo in deadKeys)
+                {
+                    instances.Remove(zdo);
+                    if (zdo != null && zdo.m_uid != ZDOID.None && zdo.IsValid())
+                    {
+                        zdo.Created = false; // разрешаем пересоздание
+                        Debug.Log($"[TrollBuild] Revived stuck ZDO {zdo.m_uid} (dead GO, Created reset)");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[TrollBuild] RemoveObjects cleanup failed: " + e.Message);
+            }
+        }
+    }
+
+    #endregion
+
+    #region Телепорт к порталу на тролле (методология ValheimRAFT Teleport_Patch)
+
+    [HarmonyPatch]
+    public static class TrollPortalTeleport_Patch
+    {
+        private static readonly MethodInfo s_pokeLocalZone =
+            AccessTools.Method(typeof(ZoneSystem), "PokeLocalZone");
+
+        private static void PokeZone(Vector2s zone)
+        {
+            try
+            {
+                if (ZoneSystem.instance != null && s_pokeLocalZone != null)
+                    s_pokeLocalZone.Invoke(ZoneSystem.instance, new object[] { zone });
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[TrollBuild] PokeLocalZone failed: " + e.Message);
+            }
+        }
+
+        [HarmonyPatch(typeof(TeleportWorld), "Teleport")]
+        [HarmonyPrefix]
+        private static bool Teleport_Prefix(TeleportWorld __instance, Player player)
+        {
+            try
+            {
+                if (player == null) return true;
+                ZNetView nv = __instance.GetComponent<ZNetView>();
+                if (nv == null || !nv.IsValid() || nv.GetZDO() == null) return true;
+
+                ZDOID targetId = nv.GetZDO().GetConnectionZDOID(ZDOExtraData.ConnectionType.Portal);
+                if (targetId == ZDOID.None) return true;
+                ZDO targetZdo = ZDOMan.instance.GetZDO(targetId);
+                if (targetZdo == null) return true;
+
+                // цель: только ВИДИМЫЙ живой GO, иначе актуальный ZDO
+                ZNetView targetView = null;
+                ZNetView anyView = ZNetScene.instance != null ? ZNetScene.instance.FindInstance(targetZdo) : null;
+                if (anyView != null && anyView.gameObject.activeInHierarchy)
+                    targetView = anyView;
+
+                Vector3 pos = targetView != null ? targetView.transform.position : targetZdo.GetPosition();
+                Quaternion rot = targetView != null ? targetView.transform.rotation : targetZdo.GetRotation();
+
+                Vector3 exit = pos + rot * Vector3.forward * __instance.m_exitDistance + Vector3.up;
+                ClampToGround(ref exit);
+
+                Debug.Log($"[TrollBuild] Portal teleport start: targetGO={(targetView != null)} exit={exit.ToString("F1")}");
+                player.TeleportTo(exit, rot, true);
+
+                if (TrollWalkManager.Instance != null)
+                    TrollWalkManager.Instance.StartCoroutine(
+                        DeliverPlayerToPortal(player, targetId, __instance.m_exitDistance));
+
+                return false;
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[TrollBuild] Portal teleport patch failed: " + e.Message);
+                return true;
+            }
+        }
+
+        private static void ClampToGround(ref Vector3 exit)
+        {
+            try
+            {
+                float ground = ZoneSystem.instance != null ? ZoneSystem.instance.GetGroundHeight(exit) : 0f;
+                if (ground > 0f && exit.y > ground + 1.5f) exit.y = ground + 1f;
+            }
+            catch { }
+        }
+
+        private static IEnumerator DeliverPlayerToPortal(Player player, ZDOID targetId, float exitDistance)
+        {
+            float deadline = Time.realtimeSinceStartup + 25f;
+
+            // 1) ждём конца телепорта
+            while (player != null && player && player.IsTeleporting() &&
+                   Time.realtimeSinceStartup < deadline)
+            {
+                yield return null;
+            }
+            if (player == null || !player) yield break;
+
+            // 2) ждём появления живого ВИДИМОГО GO портала, подгружая зону
+            ZNetView targetView = null;
+            while (Time.realtimeSinceStartup < deadline)
+            {
+                if (ZNetScene.instance == null) yield break;
+                ZDO tz = ZDOMan.instance.GetZDO(targetId);
+                if (tz != null)
+                {
+                    ZNetView anyView = ZNetScene.instance.FindInstance(tz);
+                    if (anyView != null && anyView.gameObject.activeInHierarchy)
+                    {
+                        targetView = anyView;
+                        break;
+                    }
+
+                    string uuid = tz.GetString(TrollBuildConstants.HashTrollUUID, "");
+                    if (!string.IsNullOrEmpty(uuid))
+                    {
+                        ZDOID trollId = ParseZDOID(uuid);
+                        if (trollId != ZDOID.None)
+                        {
+                            ZDO trollZdo = ZDOMan.instance.GetZDO(trollId);
+                            if (trollZdo != null)
+                                PokeZone(ZoneSystem.GetZone(trollZdo.GetPosition()));
+                        }
+                    }
+                    PokeZone(ZoneSystem.GetZone(tz.GetPosition()));
+                }
+                yield return new WaitForFixedUpdate();
+            }
+
+            if (targetView == null)
+            {
+                Debug.Log("[TrollBuild] Portal delivery: target GO did not spawn in time");
+                yield break;
+            }
+
+            // 3) доставляем к актуальной позиции портала
+            Vector3 pos = targetView.transform.position;
+            Quaternion rot = targetView.transform.rotation;
+            Vector3 exit = pos + rot * Vector3.forward * exitDistance + Vector3.up;
+            ClampToGround(ref exit);
+
+            if (player != null && player)
+            {
+                player.transform.position = exit;
+                Rigidbody rb = player.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    rb.position = exit;
+                    rb.linearVelocity = Vector3.zero;
+                    rb.angularVelocity = Vector3.zero;
+                }
+                if (ZNet.instance != null) ZNet.instance.SetReferencePosition(exit);
+                Debug.Log($"[TrollBuild] Player delivered to portal GO at {exit.ToString("F1")}");
+            }
+        }
+
+        private static ZDOID ParseZDOID(string s)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(s)) return ZDOID.None;
+                string[] parts = s.Split(':');
+                if (parts.Length == 2 &&
+                    long.TryParse(parts[0], out long user) &&
+                    uint.TryParse(parts[1], out uint id))
+                    return new ZDOID(user, id);
+            }
+            catch { }
+            return ZDOID.None;
         }
     }
 
