@@ -13,8 +13,6 @@ using UnityEngine.UI;
 
 namespace TrollBuildingMod
 {
-    #region Константы / локализация / иконки
-
     public static class TrollWalkConstants
     {
         public const string KeyActive = "TrollWalk_Active";
@@ -157,10 +155,6 @@ namespace TrollBuildingMod
                 new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect);
         }
     }
-
-    #endregion
-
-    #region Контроллер тролля
 
     public class TrollWalkController : MonoBehaviour
     {
@@ -349,10 +343,6 @@ namespace TrollBuildingMod
         }
     }
 
-    #endregion
-
-    #region Менеджер
-
     public class TrollWalkManager : MonoBehaviour
     {
         public static TrollWalkManager Instance;
@@ -363,7 +353,6 @@ namespace TrollBuildingMod
         private static readonly MethodInfo s_wakeupMethod =
             AccessTools.Method(typeof(MonsterAI), "Wakeup");
 
-        // Локальные координаты постройки на тролле (из ZDO, стабильны)
         internal class PieceOffsetData
         {
             public ZDO Zdo;
@@ -450,6 +439,7 @@ namespace TrollBuildingMod
 
         private void HardReset()
         {
+            TrollPieceZdoIndex.Clear();
             if (s_routes.Count == 0 && !TrollWalkRouteSession.Active) return;
             Minimap mm = Minimap.instance;
             foreach (RouteInfo ri in s_routes.Values) RemoveRoutePins(mm, ri);
@@ -477,19 +467,6 @@ namespace TrollBuildingMod
             }
         }
 
-        // =====================================================================
-        // СИМУЛЯЦИЯ ВНЕ ЗОНЫ. ЕДИНАЯ ТОЧКА ИСТИНЫ: ZDO построек ВСЕГДА
-        // печатается в позицию носителя (методология ValheimRAFT):
-        //  - юзер рядом: реальный режим, кеш offsets НЕ зануляем, а обновляем;
-        //  - GO жив вне зоны: AI ведёт -> не мешаем + печать; замер ->
-        //    ведём GO телепортом + печать;
-        //  - GO снесён: чистый виртуал — ZDO тролля + ZDO построек едут вместе
-        //    по ЛОКАЛЬНЫМ координатам (HashLocalPos/HashLocalRotQ),
-        //    высота платформы учитывается через DefaultBuildRootOffset.
-        //  ПЕРЕЗАХОД: кеш PieceOffsets рантаймовый — при пустом кеше он
-        //  восстанавливается из персистентного реестра построек
-        //  (HashPieces в ZDO тролля + HashLocalPos в ZDO построек).
-        // =====================================================================
         private void VirtualStep()
         {
             List<ZDOID> ids = s_routes.Keys.ToList();
@@ -508,8 +485,6 @@ namespace TrollBuildingMod
 
                 if (!s_routes.TryGetValue(id, out RouteInfo ri)) { NotifyActive(id); continue; }
 
-                // после перезахода кеш пуст — восстанавливаем из персистентного
-                // реестра (HashPieces в ZDO тролля) и продолжаем печать ZDO построек
                 if (ri.PieceOffsets.Count == 0)
                     RestorePieceOffsets(zdo, ri);
 
@@ -523,8 +498,6 @@ namespace TrollBuildingMod
 
                 ZNetView inst = ZNetScene.instance != null ? ZNetScene.instance.FindInstance(zdo) : null;
 
-                // 1) ЮЗЕР РЯДОМ — реальный режим. Кеш НЕ зануляем (иначе после
-                //    сноса GO его некому пересобрать), а ОБНОВЛЯЕМ
                 if (inst != null && ZNetScene.InActiveArea(inst.transform.position, refPos))
                 {
                     ri.ProgressInit = false;
@@ -572,14 +545,13 @@ namespace TrollBuildingMod
                     zdo.SetPosition(fin);
                     zdo.Set(TrollWalkConstants.HashLastPos, fin);
                     zdo.Set(TrollWalkConstants.HashLastUpdate, ZNet.instance.GetTime().Ticks);
-                    if (ri.PieceOffsets.Count == 0) RestorePieceOffsets(zdo, ri); // страховка
+                    if (ri.PieceOffsets.Count == 0) RestorePieceOffsets(zdo, ri);
                     MoveVirtualPieces(ri, fin, trollRot);
                     continue;
                 }
 
                 if (inst != null)
                 {
-                    // 2) GO жив, юзер далеко
                     Vector3 goPos = inst.transform.position;
                     if (!ri.ProgressInit)
                     {
@@ -589,23 +561,22 @@ namespace TrollBuildingMod
                     }
                     if (Utils.DistanceXZ(goPos, ri.ProgressPos) > 1f)
                     {
-                        ri.ProgressPos = goPos; // AI сам ведёт — не мешаем
-                        MoveVirtualPieces(ri, goPos, inst.transform.rotation); // печать
+                        ri.ProgressPos = goPos;
+                        MoveVirtualPieces(ri, goPos, inst.transform.rotation);
                         continue;
                     }
 
                     MoveTrollGOForward(zdo, inst, dir, travel);
                     ri.ProgressPos = inst.transform.position;
-                    MoveVirtualPieces(ri, inst.transform.position, inst.transform.rotation); // печать
+                    MoveVirtualPieces(ri, inst.transform.position, inst.transform.rotation);
                     continue;
                 }
 
-                // 3) GO нет — чистый виртуал
                 Vector3 newPos = pos + dir * travel;
                 zdo.SetPosition(newPos);
                 zdo.Set(TrollWalkConstants.HashLastPos, newPos);
                 zdo.Set(TrollWalkConstants.HashLastUpdate, ZNet.instance.GetTime().Ticks);
-                if (ri.PieceOffsets.Count == 0) RestorePieceOffsets(zdo, ri); // страховка
+                if (ri.PieceOffsets.Count == 0) RestorePieceOffsets(zdo, ri);
                 MoveVirtualPieces(ri, newPos, trollRot);
             }
         }
@@ -638,9 +609,6 @@ namespace TrollBuildingMod
             }
         }
 
-        // Печать ZDO построек = позиция тролля + DefaultBuildRootOffset (3.35 м
-        // вверх — ВЫСОТА ПЛАТФОРМЫ, LocalPos считается от BuildRoot!) +
-        // локальные координаты, повёрнутые по курсу тролля
         private static void MoveVirtualPieces(RouteInfo ri, Vector3 trollPos, Quaternion trollRot)
         {
             if (ri == null || ri.PieceOffsets == null || ri.PieceOffsets.Count == 0) return;
@@ -663,7 +631,6 @@ namespace TrollBuildingMod
             }
         }
 
-        // Обновление кеша из живых GO (attached + pending)
         internal void RefreshPieceOffsets(ZDOID id)
         {
             if (!s_routes.TryGetValue(id, out RouteInfo ri)) return;
@@ -671,7 +638,7 @@ namespace TrollBuildingMod
             if (zdo == null) return;
 
             ZNetView inst = ZNetScene.instance != null ? ZNetScene.instance.FindInstance(zdo) : null;
-            if (inst == null) return; // GO нет — существующий кеш НЕ трогаем
+            if (inst == null) return;
 
             TrollPiecesContainer cont = inst.GetComponent<TrollPiecesContainer>();
             if (cont == null) return;
@@ -712,26 +679,19 @@ namespace TrollBuildingMod
             });
         }
 
-        // =====================================================================
-        // ВОССТАНОВЛЕНИЕ ПОСЛЕ ПЕРЕЗАХОДА: список ZDOID построек тролля
-        // хранится строкой в ZDO самого тролля (HashPieces — пишется в
-        // RegisterPiece), локальные координаты — в ZDO построек
-        // (HashLocalPos/HashLocalRotQ). Кеш рантаймовый и после загрузки
-        // пуст — восстанавливаем и печать продолжается.
-        // =====================================================================
         internal void RestorePieceOffsets(ZDO zdo, RouteInfo ri)
         {
             if (ri == null || ri.PieceOffsets.Count > 0) return;
             try
             {
-                string list = zdo.GetString(TrollBuildConstants.HashPieces, "");
-                if (string.IsNullOrEmpty(list)) return;
+                string guid = zdo.GetString(TrollBuildConstants.HashTrollUUID, "");
+                if (string.IsNullOrEmpty(guid)) return;
 
-                foreach (string part in list.Split(';'))
+                List<ZDO> pieces = TrollPieceZdoIndex.GetPieces(guid);
+                if (pieces == null) return;
+
+                foreach (ZDO pz in pieces)
                 {
-                    ZDOID id = ParseZDOID(part);
-                    if (id == ZDOID.None) continue;
-                    ZDO pz = ZDOMan.instance.GetZDO(id);
                     if (pz == null || pz.m_uid == ZDOID.None || !pz.IsValid()) continue;
 
                     Vector3 lp = pz.GetVec3(TrollBuildConstants.HashLocalPos, Vector3.zero);
@@ -751,27 +711,12 @@ namespace TrollBuildingMod
                 }
 
                 if (ri.PieceOffsets.Count > 0)
-                    Debug.Log($"[TrollWalk] Restored {ri.PieceOffsets.Count} piece offsets from troll ZDO (post-load)");
+                    Debug.Log($"[TrollWalk] Restored {ri.PieceOffsets.Count} piece offsets via GUID index (post-load)");
             }
             catch (Exception e)
             {
                 Debug.LogWarning("[TrollWalk] RestorePieceOffsets failed: " + e.Message);
             }
-        }
-
-        internal static ZDOID ParseZDOID(string s)
-        {
-            try
-            {
-                if (string.IsNullOrEmpty(s)) return ZDOID.None;
-                string[] parts = s.Split(':');
-                if (parts.Length == 2 &&
-                    long.TryParse(parts[0], out long user) &&
-                    uint.TryParse(parts[1], out uint id))
-                    return new ZDOID(user, id);
-            }
-            catch { }
-            return ZDOID.None;
         }
 
         private void BackgroundScan()
@@ -1109,10 +1054,6 @@ namespace TrollBuildingMod
         }
     }
 
-    #endregion
-
-    #region Сессия маршрута
-
     public static class TrollWalkRouteSession
     {
         public static bool Active;
@@ -1355,10 +1296,6 @@ namespace TrollBuildingMod
         }
     }
 
-    #endregion
-
-    #region Harmony-патчи
-
     [HarmonyPatch]
     public static class TrollWalkPatches
     {
@@ -1574,7 +1511,6 @@ namespace TrollBuildingMod
             return TrollWalkManager.HandleOurPinRemoval(__instance, our);
         }
 
-        // Синхронизация ZDO активных троллей И ИХ ПОСТРОЕК всем клиентам
         [HarmonyPatch(typeof(ZDOMan), "CreateSyncList")]
         [HarmonyPostfix]
         private static void ZDOMan_CreateSyncList_Postfix(ZDOMan __instance, List<ZDO> toSync)
@@ -1604,6 +1540,4 @@ namespace TrollBuildingMod
             catch { }
         }
     }
-
-    #endregion
 }
