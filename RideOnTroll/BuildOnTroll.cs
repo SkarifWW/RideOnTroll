@@ -9,26 +9,25 @@ using UnityEngine.Rendering;
 
 // ============================================================================
 //  ИСТОРИЯ ФИКСОВ:
-//  FIX 1..6: сохранность построек (ZNetView_Awake, износ, поддержка, индекс,
-//            Attach, выгрузка сцены).
-//  FIX 9..10: платформенная навигация (габарит, occupancy-сетка, A*).
-//  FIX 11: TreeSync/TreeLog через reflection.
-//  FIX 12: ломание: белый список, урон по таймеру, таймаут от удара.
-//  FIX 13: восстановление потерянной платформы + диагностика.
-//  FIX 14 (текущее):
-//   14a. ЦЕЛЬ ЛОМАНИЯ — ТОЛЬКО реальный блокатор: коллайдер, в который
-//        упёрлись щупы платформы/тела чуть впереди. Никаких сфер-поисков —
-//        дальние/ненужные препятствия (dist=103/168м из лога) больше не
-//        выбираются. Позиция цели = ближайшая точка коллайдера (лечение
-//        «бить по пустому месту» у упавшего бревна).
-//   14b. Выпечка габарита защищена: Physics.SyncTransforms() перед чтением
-//        bounds, мусорные коллайдеры >25 м отбрасываются, центр и радиус
-//        жёстко ограничены (радиус ≤16 м). Именно протухшие bounds давали
-//        радиус в сотни метров.
-//   14c. Приручённый тролль БЕЗ построек тоже ходит через планировщик и
-//        ломает препятствия (габарит = тело тролля). Дикие тролли — ваниль.
-//   14d. Дальность удара фиксированная (5.5 м до ближайшей точки цели),
-//        урон 250, toolTier 4.
+//  FIX 1..6: сохранность построек.
+//  FIX 9..16: итерации платформенной навигации (сетка/A*/ломание).
+//  FIX 13: восстановление потерянной платформы.
+//  FIX 17 (текущее, ГИБРИДНАЯ АРХИТЕКТУРА):
+//   17a. РЕЖИМЫ: навигатор и ломание работают ТОЛЬКО в режиме маршрута
+//        (TrollWalk, ZDO-флаг HashActive) и только при наличии построек.
+//        Следование/охрана/idle/дикие тролли/без платформы — чистая ваниль.
+//   17b. ВАНИЛЬ ВЕДЁТ: путь берётся из BaseAI.FindPath (рельеф, склоны,
+//        вода). Мод НЕ строит свой путь — 2D-сетку 40x40 и A* удалены.
+//   17c. МОД КОНТРОЛИРУЕТ ГАБАРИТ: вдоль ванильного пути выполняется
+//        OverlapBox объёмом платформы (клиренс 1.4 м от земли — низкие
+//        валуны/жилы перешагиваются). Чисто — идём по ванильному пути.
+//   17d. КАСАТЕЛЬНЫЙ ОБЪЕЗД: коробка заблокирована — пробуем отклонения
+//        ±25/45/65° (гистерезис стороны). Ломание — ТОЛЬКО когда объезд
+//        невозможен (это и решает «ломает лишнее»).
+//   17e. СООБЩЕНИЕ «не протиснуться» — только по физическому простою
+//        ≥4.5 с в маршрутном режиме. Никаких сообщений от планировщика.
+//   17f. Ломание: только вперёд (Dot>=0.3), без MineRock, без данжей,
+//        подход в упор (3 м), урон 250 / toolTier 4.
 // ============================================================================
 namespace TrollBuildingMod
 {
@@ -149,88 +148,59 @@ namespace TrollBuildingMod
     }
 
     // ========================================================================
-    //  ПЛАТФОРМЕННЫЙ НАВИГАТОР (FIX 9..16)
-    //  FIX 16 (текущее):
-    //   16a. КЛИРЕНС 1.4 м: щупы не сканируют ниже StepClearance (+радиус
-    //        щупа) — валуны, пни и жилы MineRock5 тролль перешагивает.
-    //   16b. MineRock/MineRock5 исключены из белого списка ломания.
-    //   16c. Коллайдеры данжей (base_model/cube/entrance/dungeon/crypt) не
-    //        рассматриваются как цели ломания и не спамят диагностику;
-    //        для сетки они остаются препятствиями — тролль обходит.
-    //   16d. HandlePartialArrival: завершение частичного отрезка — ШТАТНАЯ
-    //        ситуация. Без NotifyBlocked, без «прибыл» (return false) —
-    //        следующий отрезок строится бесшовно.
-    //   16e. FailCooldown 0.5 с — никаких зависаний по 3 секунды; блокировка
-    //        щупа => мгновенная перепланировка в обход.
-    //   16f. Дальний щуп ломания — ТОЛЬКО в тупике и фиксированно 3 м;
-    //        цель выбирается в пределах 4.5/6 м, удар с <=3 м.
-    //  Из FIX 15 сохранено: щупы от реальной высоты земли (склоны), цель
-    //  ломания только ВПЕРЕДИ (Dot>=0.3), фоллбек направляющей, тайминги
-    //  застревания 2.5 с, частичный путь при занятой цели.
+    //  ЛУЧЕВОЙ НАВИГАТОР (FIX 18)
+    //  Алгоритм: толстый луч (BoxCast шириной платформы) ПРЯМО к цели;
+    //  препятствие -> веер альтернативных лучей; свободных мест нет ->
+    //  ломание блокатора. Полный рантайм: пересчёт каждые 0.1 с, никаких
+    //  сеток/A*/запечённых путей — объекты, прогрузившиеся по ходу,
+    //  учитываются автоматически.
+    //  Порядок решений: прямой луч -> малый веер (до 45°) -> ЛОМАНИЕ
+    //  блокатора -> широкий веер (до 150°) -> наименее перекрытое
+    //  направление (скольжение вдоль стены) -> стоп + сообщение.
+    //  Работает только в режиме маршрута TrollWalk при наличии построек.
     // ========================================================================
     public class TrollPlatformNavigator
     {
         // ---------- конфигурация ----------
-        private const float CellSize = 1.1f;
-        private const int GridDim = 40;
-        private const int HalfDim = GridDim / 2;
-        private const int CellsPerUpdate = 96;
-        private const float GridUpdateInterval = 0.06f;
-        private const float PlanHorizon = 18f;
-        private const float RepathInterval = 1.5f;
-        private const float RepathGoalShift = 2.5f;
-        private const float WaypointReachedDist = 1.0f;
-        private const int MaxIterations = 4000;
-        private const int HeapCapacity = 8192;
-        private const float VerifyInterval = 0.25f;
+        private const float MainRayLength = 5.0f;     // главный луч вперёд
+        private const float SideRayLength = 3.5f;     // длина боковых лучей
+        private const float ProbeHalfThick = 0.5f;    // толщина луча вдоль движения
+        private const float SideMargin = 0.25f;      // запас по ширине
+        private const float StepClearance = 1.4f;     // ниже — перешагиваем
+        private const float CastInterval = 0.1f;      // рантайм-пересчёт (10 Гц)
 
-        // FIX 15d: разворот на 180° (~3 с при 60°/с) — не «застревание»
-        private const float StuckTime = 2.5f;
-        private const int MaxFailStreak = 4;
-        private const float FailCooldown = 0.5f;      // FIX 16e: было 3
+        // малый веер: касательный обход
+        private static readonly float[] SteerAngles = { 10f, 22f, 35f, 45f };
+        // широкий веер: скольжение вокруг не-ломаемых стен
+        private static readonly float[] WideAngles = { 60f, 80f, 100f, 125f, 150f };
 
-        // ломание препятствий
-        private const float BreakTimeout = 25f;        // от последнего удара
-        private const float BreakSwingInterval = 1.2f;
-        private const float BreakSwingRange = 3.0f;    // FIX 16f: подход в упор
+        // ломание
+        private const float BreakPickMax = 7f;         // блокатор дальше — не выбираем
+        private const float BreakSwingRange = 3.0f;   // дистанция удара
+        private const float BreakSwingInterval = 1.15f;
         private const float BreakDamage = 250f;
         private const int BreakToolTier = 4;
+        private const float BreakTimeout = 25f;       // от последнего удара
+        private const float ForwardDotMin = 0.25f;    // цель только впереди
         private const float FailedTreeMemory = 30f;
         private const float FailedTreeRadius = 3f;
+
+        // простой/сообщения
+        private const float StallMsgTime = 6f;         // секунд стояния до сообщения
+        private const float StallSideFlip = 3f;        // смена стороны объезда при простое
         private const float DiagLogInterval = 3f;
-        private const float BreakSearchInterval = 0.4f;
-        private const float AheadProbeDist = 1.3f;
-        private const float ForwardDotMin = 0.3f;      // FIX 15b: только вперёд
-        private const float FarProbeDist = 3.0f;       // FIX 16f: было footRadius+2.5
-        private const float BreakPickNearMax = 4.5f;    // FIX 16f
-        private const float BreakPickFarMax = 6.0f;     // FIX 16f
 
-        // FIX 16a: клиренс — что ниже, тролль перешагивает
-        private const float StepClearance = 1.4f;
-
+        // габарит
         private const float DetailProbeRadius = 0.75f;
         private const float FootMaxHalfExtent = 12f;
         private const float FootMaxCenterOffset = 8f;
         private const float FootMaxRadius = 16f;
         private const float FootGarbageDist = 25f;
 
-        private const byte Unknown = 0;
-        private const byte Free = 1;
-        private const byte Blocked = 2;
-
         private static readonly int ObstacleMask =
             LayerMask.GetMask("Default", "static_solid", "Default_small", "piece");
-        private static readonly Collider[] s_hits = new Collider[128];
-        private static readonly List<Collider> s_blockers = new List<Collider>();
-
-        private static readonly MethodInfo s_findPathMethod = AccessTools.Method(typeof(BaseAI), "FindPath");
-        private static readonly FieldInfo s_pathField = AccessTools.Field(typeof(BaseAI), "m_path");
-
-        private static readonly int[] Dx = { 1, -1, 0, 0, 1, 1, -1, -1 };
-        private static readonly int[] Dz = { 0, 0, 1, -1, 1, -1, 1, -1 };
-        private static readonly float[] StepCost = { 1f, 1f, 1f, 1f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f };
-
-        private static int[] s_spiral;
+        private static readonly RaycastHit[] s_castHits = new RaycastHit[16];
+        private static readonly Collider[] s_hits = new Collider[32];
 
         private static readonly Type s_treeSyncType = FindTreeTypeByName("TreeSync");
         private static readonly Type s_treeLogType = FindTreeTypeByName("TreeLog");
@@ -250,7 +220,7 @@ namespace TrollBuildingMod
             return null;
         }
 
-        // FIX 16c: коллайдеры архитектуры данжей — не цели ломания
+        // коллайдеры архитектуры данжей — не цели ломания
         private static bool IsDungeonCollider(Collider c)
         {
             string n = c.gameObject.name;
@@ -268,52 +238,43 @@ namespace TrollBuildingMod
         }
 
         private readonly TrollPiecesContainer m_owner;
-        private readonly byte[] m_cells = new byte[GridDim * GridDim];
-        private int m_originX = int.MinValue;
-        private int m_originZ;
-        private int m_sweepPos;
-        private float m_lastGridUpdate = -1f;
 
-        private readonly float[] m_gScore = new float[GridDim * GridDim];
-        private readonly int[] m_cameFrom = new int[GridDim * GridDim];
-        private readonly int[] m_stamp = new int[GridDim * GridDim];
-        private readonly int[] m_heap = new int[HeapCapacity];
-        private readonly float[] m_heapF = new float[HeapCapacity];
-        private int m_heapCount;
-        private int m_generation;
+        // рантайм-состояние (пересчитывается каждые CastInterval)
+        private float m_lastCast = -1f;
+        private bool m_moveDirValid;
+        private Vector3 m_moveDir;
+        private Collider m_forwardBlocker;      // ближайшее чужое, что перекрыло главный луч
+        private bool m_wideFreeValid;
+        private Vector3 m_wideFreeDir;
+        private bool m_leastDirValid;
+        private Vector3 m_leastDir;
+        private float m_leastFree;
 
-        private readonly List<Vector3> m_path = new List<Vector3>();
-        private readonly List<int> m_revCells = new List<int>();
-        private int m_pathIndex;
-        private bool m_hasPlan;
-        private bool m_planPartial;
-        private Vector3 m_planGoal;
-        private float m_lastPlanTime = -10f;
-        private float m_nextPlanAllowed;
-
-        private float m_lastVerifyTime;
-        private bool m_lastVerifyResult = true;
-        private float m_stuckTimer;
-        private Vector3 m_lastStuckPos;
-        private int m_failStreak;
+        private int m_steerSide;                // гистерезис стороны (—1/0/+1)
+        private float m_stallTimer;
+        private Vector3 m_lastStallPos;
+        private float m_lastFlipMark;
         private float m_lastBlockedMsg = -30f;
         private float m_lastTreeMsg = -30f;
-
-        private BreakTarget m_break;
-        private float m_breakStarted;
-        private float m_nextSwing;
-        private float m_nextBreakSearch;
-        private readonly List<Vector3> m_failedTreePos = new List<Vector3>();
-        private readonly List<float> m_failedTreeTime = new List<float>();
         private float m_lastDiagLog = -30f;
-        private float m_lastLandedSwing = -30f;
-        private int m_swingCount;
 
+        // ломание
+        private BreakTarget m_break;
+        private float m_lastLandedSwing = -30f;
+        private float m_nextSwing;
+        private int m_swingCount;
+        private readonly List<Vector3> m_failedTreePos = new List<Vector3>();
+
+        // выпеченный габарит
         private int m_footVersion = -1;
         private readonly List<Vector2> m_footPoints = new List<Vector2>();
         private float[] m_footHeights = { 3f };
         private float m_footRadius = 0f;
-        private float m_footMidY = 3.3f;
+        private float m_boxHalfX = 1.5f;
+        private float m_spanMin = 2f;
+        private float m_spanMax = 4.5f;
+        private float m_spanMid = 3.2f;
+        private float m_spanHalf = 1.2f;
 
         public TrollPlatformNavigator(TrollPiecesContainer owner)
         {
@@ -322,11 +283,20 @@ namespace TrollBuildingMod
 
         public void Invalidate()
         {
-            m_hasPlan = false;
             m_footVersion = -1;
         }
 
         public bool IsBreaking => m_break != null;
+
+        public void OnRouteEnded()
+        {
+            m_break = null;
+            m_steerSide = 0;
+            m_stallTimer = 0f;
+            m_moveDirValid = false;
+            m_wideFreeValid = false;
+            m_leastDirValid = false;
+        }
 
         public float FootprintRadius
         {
@@ -334,7 +304,8 @@ namespace TrollBuildingMod
         }
 
         // ====================================================================
-        //  Основной вход (патч BaseAI.MoveTo)
+        //  Основной вход (патч BaseAI.MoveTo; вызывается только в режиме
+        //  маршрута TrollWalk при наличии построек — гейт в хуке).
         // ====================================================================
         public bool DriveMoveTo(BaseAI ai, float dt, Vector3 point, float dist, bool run)
         {
@@ -343,583 +314,173 @@ namespace TrollBuildingMod
             if (Utils.DistanceXZ(point, pos) <= arrive)
             {
                 ai.StopMoving();
-                ResetPlan();
+                m_break = null;
+                m_stallTimer = 0f;
                 return true;
             }
 
             if (m_break != null)
                 return UpdateBreaking(ai, dt);
 
-            // FIX 15c: направляющая есть ВСЕГДА (террен-путь либо прямая)
-            GetGuide(ai, point, out Vector3 guide);
-
-            bool needPlan = !m_hasPlan
-                || m_pathIndex >= m_path.Count
-                || Time.time - m_lastPlanTime > RepathInterval
-                || Utils.DistanceXZ(guide, m_planGoal) > RepathGoalShift;
-
-            if (needPlan && Time.time >= m_nextPlanAllowed)
-                DoPlan(pos, guide);
-
-            if (m_hasPlan && m_pathIndex < m_path.Count)
+            Vector3 to = point - pos;
+            to.y = 0f;
+            float d = to.magnitude;
+            if (d < 0.05f)
             {
-                while (m_pathIndex < m_path.Count
-                    && Utils.DistanceXZ(m_path[m_pathIndex], pos) < WaypointReachedDist)
-                    m_pathIndex++;
+                ai.StopMoving();
+                TrackStall(pos, dt);
+                return false;
+            }
+            Vector3 dir = to / d;   // луч ПРЯМО к цели
 
-                if (m_pathIndex < m_path.Count)
-                {
-                    Vector3 wp = m_path[m_pathIndex];
-                    Vector3 dir = wp - pos;
-                    dir.y = 0f;
-                    if (dir.sqrMagnitude > 1e-8f)
-                    {
-                        dir.Normalize();
-
-                        if (Time.time - m_lastVerifyTime >= VerifyInterval)
-                        {
-                            m_lastVerifyTime = Time.time;
-                            m_lastVerifyResult = FootprintPassable(pos + dir * AheadProbeDist, Quaternion.LookRotation(dir));
-                        }
-
-                        if (m_lastVerifyResult)
-                        {
-                            ai.MoveTowards(dir, run);
-                            TrackStuck(pos, dt);
-                            return false;
-                        }
-
-                        // FIX 16f: здесь ищем ТОЛЬКО то, что касается прямо сейчас
-                        if (TryStartBreaking(ai, pos, dir, false))
-                            return false;
-
-                        MarkAheadBlocked(pos, dir);
-                        m_hasPlan = false;   // FIX 16e: мгновенная перепланировка
-                        ai.StopMoving();
-                        return false;
-                    }
-                }
-                else
-                {
-                    ai.StopMoving();
-                    if (m_planPartial) return HandlePartialArrival(ai, dt, pos, point);
-                    m_hasPlan = false;
-                    return false;
-                }
+            // рантайм-пересчёт лучей (прогрузка объектов учитывается сама)
+            if (Time.time - m_lastCast >= CastInterval)
+            {
+                m_lastCast = Time.time;
+                Recast(pos, dir);
             }
 
-            if (m_planPartial && m_pathIndex >= m_path.Count)
-                return HandlePartialArrival(ai, dt, pos, point);
+            // 1) прямой либо касательный коридор найден — идём
+            if (m_moveDirValid)
+            {
+                ai.MoveTowards(m_moveDir, run);
+                TrackStall(pos, dt);
+                return false;
+            }
 
-            Vector3 dirGoal = point - pos;
-            dirGoal.y = 0f;
-            if (dirGoal.sqrMagnitude > 0.01f && TryStartBreaking(ai, pos, dirGoal.normalized, true))
+            // 2) всё перекрыто на малых углах — ломаем блокатор главного луча
+            if (m_forwardBlocker != null && TryStartBreaking(ai, pos, dir))
                 return false;
 
-            ai.StopMoving();
-            TrackStuck(pos, dt);
-            return false;
-        }
-
-        // FIX 16d: конец частичного отрезка — ШТАТНО. Никаких сообщений,
-        // никакого «прибыл»: следующий отрезок построится на следующем тике.
-        // Если впереди стена из деревьев — дальний щуп найдёт блокатор
-        // (только здесь, 16f) и тролль начнёт расчищать.
-        private bool HandlePartialArrival(BaseAI ai, float dt, Vector3 pos, Vector3 point)
-        {
-            Vector3 toGoal = point - pos;
-            toGoal.y = 0f;
-            if (toGoal.sqrMagnitude > 0.01f && TryStartBreaking(ai, pos, toGoal.normalized, true))
+            // 3) блокатор не ломается — широкий свободный коридор
+            if (m_wideFreeValid)
+            {
+                ai.MoveTowards(m_wideFreeDir, run);
+                TrackStall(pos, dt);
                 return false;
+            }
+
+            // 4) не ломается и всё перекрыто — скользим вдоль стены
+            //    (наименее перекрытое направление — НИКОГДА не стоим на месте)
+            if (m_leastDirValid)
+            {
+                ai.MoveTowards(m_leastDir, run);
+                TrackStall(pos, dt);
+                return false;
+            }
 
             ai.StopMoving();
-            TrackStuck(pos, dt);
+            TrackStall(pos, dt);
             return false;
         }
 
-        private void ResetPlan()
+        // ====================================================================
+        //  РУНТАЙМ-ПЕРЕСЧЁТ ЛУЧЕЙ
+        // ====================================================================
+        private void Recast(Vector3 pos, Vector3 dir)
         {
-            m_hasPlan = false;
-            m_pathIndex = 0;
-        }
+            m_moveDirValid = false;
+            m_wideFreeValid = false;
+            m_leastDirValid = false;
+            m_forwardBlocker = null;
+            m_leastFree = -1f;
 
-        // ====================================================================
-        //  Слой 1: ванильный террен-путь + фоллбек прямой (FIX 15c)
-        // ====================================================================
-        private void GetGuide(BaseAI ai, Vector3 point, out Vector3 guide)
-        {
-            guide = point;
-            try
+            // главный луч прямо к цели
+            float fwd = CastDir(pos, dir, MainRayLength, out Collider fwdBlocker);
+            m_forwardBlocker = fwdBlocker;
+            m_leastDir = dir;
+            m_leastFree = fwd;
+
+            if (fwdBlocker == null)
             {
-                if (s_findPathMethod != null && s_pathField != null)
-                {
-                    bool ok = (bool)s_findPathMethod.Invoke(ai, new object[] { point });
-                    if (ok)
-                    {
-                        var path = s_pathField.GetValue(ai) as List<Vector3>;
-                        if (path != null && path.Count > 0)
-                        {
-                            Vector3 pos = ai.transform.position;
-                            Vector3 best = path[0];
-                            float acc = 0f;
-                            Vector3 prev = pos;
-                            foreach (Vector3 wp in path)
-                            {
-                                float d = Utils.DistanceXZ(prev, wp);
-                                if (acc + d > PlanHorizon) break;
-                                acc += d;
-                                best = wp;
-                                prev = wp;
-                            }
-                            guide = best;
-                            return;
-                        }
-                    }
-                }
-            }
-            catch { }
-
-            Vector3 dir = point - ai.transform.position;
-            dir.y = 0f;
-            float dist = dir.magnitude;
-            if (dist > PlanHorizon && dist > 0.01f)
-                guide = ai.transform.position + (dir / dist) * PlanHorizon;
-            else
-                guide = point;
-        }
-
-        // ====================================================================
-        //  Слой 2: A* (FIX 15e: занятая цель => частичный путь)
-        // ====================================================================
-        private void DoPlan(Vector3 pos, Vector3 guide)
-        {
-            m_lastPlanTime = Time.time;
-            m_hasPlan = false;
-            m_planPartial = false;
-            m_path.Clear();
-            m_pathIndex = 0;
-            m_planGoal = guide;
-
-            int sx = Mathf.Clamp(CellOf(pos.x) - m_originX, 0, GridDim - 1);
-            int sz = Mathf.Clamp(CellOf(pos.z) - m_originZ, 0, GridDim - 1);
-            int gx = Mathf.Clamp(CellOf(guide.x) - m_originX, 1, GridDim - 2);
-            int gz = Mathf.Clamp(CellOf(guide.z) - m_originZ, 1, GridDim - 2);
-
-            if (m_cells[gz * GridDim + gx] == Blocked && !FindNearestFree(ref gx, ref gz))
-            {
-                // FIX 15e: цель в глухих препятствиях — оставляем как есть:
-                // A* не войдёт в неё, но вернёт частичный путь к ближайшей
-                // достижимой клетке (подход к блокатору для ломания).
+                m_moveDir = dir;
+                m_moveDirValid = true;
+                return; // путь чист
             }
 
-            m_generation++;
-            m_heapCount = 0;
+            int pref = m_steerSide >= 0 ? 1 : -1;
 
-            int start = sz * GridDim + sx;
-            int goal = gz * GridDim + gx;
-            m_stamp[start] = m_generation;
-            m_gScore[start] = 0f;
-            m_cameFrom[start] = -1;
-            HeapPush(start, Heuristic(sx, sz, gx, gz));
-
-            int bestNode = start;
-            float bestH = Heuristic(sx, sz, gx, gz);
-            bool found = false;
-            int iter = 0;
-
-            while (m_heapCount > 0)
+            // малый веер: касательный обход (предпочтительная сторона первой)
+            for (int s = 0; s < 2; s++)
             {
-                if (++iter > MaxIterations) break;
-                int cur = HeapPop();
-                if (cur == goal) { found = true; break; }
-
-                int cx = cur % GridDim;
-                int cz = cur / GridDim;
-
-                for (int d = 0; d < 8; d++)
+                float sign = s == 0 ? pref : -pref;
+                foreach (float a in SteerAngles)
                 {
-                    int nx = cx + Dx[d];
-                    int nz = cz + Dz[d];
-                    if (nx < 0 || nx >= GridDim || nz < 0 || nz >= GridDim) continue;
-                    if (m_cells[nz * GridDim + nx] == Blocked) continue;
-
-                    if (d >= 4)
+                    Vector3 cand = Quaternion.Euler(0f, a * sign, 0f) * dir;
+                    if (CastDir(pos, cand, SideRayLength, out _) >= SideRayLength - 0.01f)
                     {
-                        if (m_cells[cz * GridDim + nx] == Blocked) continue;
-                        if (m_cells[nz * GridDim + cx] == Blocked) continue;
-                    }
-
-                    int nn = nz * GridDim + nx;
-                    float ng = m_gScore[cur] + StepCost[d];
-                    if (m_stamp[nn] != m_generation || ng < m_gScore[nn])
-                    {
-                        m_stamp[nn] = m_generation;
-                        m_gScore[nn] = ng;
-                        m_cameFrom[nn] = cur;
-                        float h = Heuristic(nx, nz, gx, gz);
-                        if (h < bestH) { bestH = h; bestNode = nn; }
-                        HeapPush(nn, ng + h);
+                        m_moveDir = cand;
+                        m_moveDirValid = true;
+                        m_steerSide = (int)sign;
+                        return; // обход найден — ломание не нужно
                     }
                 }
             }
 
-            if (!found)
+            // малых углов нет: главный блокатор пойдёт на ломание (в DriveMoveTo),
+            // здесь готовим широкий веер — запасной путь для не-ломаемых стен
+            for (int s = 0; s < 2; s++)
             {
-                if (bestNode == start) { PlanFailed(); return; }
-                m_planPartial = true;
-            }
-
-            int node = found ? goal : bestNode;
-            m_revCells.Clear();
-            int guard = 0;
-            while (node != -1 && node != start && guard++ < GridDim * GridDim)
-            {
-                m_revCells.Add(node);
-                node = m_cameFrom[node];
-            }
-            if (m_revCells.Count == 0) { PlanFailed(); return; }
-            m_revCells.Reverse();
-
-            int i0 = 0;
-            while (i0 < m_revCells.Count - 1)
-            {
-                int j = m_revCells.Count - 1;
-                while (j > i0 + 1 && !LineFree(m_revCells[i0], m_revCells[j])) j--;
-                m_path.Add(CellWorld(m_revCells[j], pos.y));
-                i0 = j;
-            }
-
-            m_hasPlan = m_path.Count > 0;
-            if (!m_hasPlan) { PlanFailed(); return; }
-            m_failStreak = 0;
-        }
-
-        private void PlanFailed()
-        {
-            m_failStreak++;
-            if (m_failStreak >= MaxFailStreak)
-            {
-                m_failStreak = 0;
-                m_nextPlanAllowed = Time.time + FailCooldown;
-                NotifyBlocked();
-            }
-        }
-
-        private float Heuristic(int x, int z, int gx, int gz)
-        {
-            int dx = Mathf.Abs(x - gx), dz = Mathf.Abs(z - gz);
-            int min = Mathf.Min(dx, dz);
-            return (dx + dz - min) + min * 1.41421356f;
-        }
-
-        private bool FindNearestFree(ref int gx, ref int gz)
-        {
-            for (int r = 1; r <= 8; r++)
-            {
-                for (int dz = -r; dz <= r; dz++)
-                    for (int dx = -r; dx <= r; dx++)
-                    {
-                        if (Mathf.Max(Mathf.Abs(dx), Mathf.Abs(dz)) != r) continue;
-                        int nx = gx + dx, nz = gz + dz;
-                        if (nx < 1 || nx >= GridDim - 1 || nz < 1 || nz >= GridDim - 1) continue;
-                        if (m_cells[nz * GridDim + nx] != Blocked) { gx = nx; gz = nz; return true; }
-                    }
-            }
-            return false;
-        }
-
-        private bool LineFree(int a, int b)
-        {
-            int ax = m_originX + a % GridDim, az = m_originZ + a / GridDim;
-            int bx = m_originX + b % GridDim, bz = m_originZ + b / GridDim;
-            float wx0 = CellCenter(ax), wz0 = CellCenter(az);
-            float wx1 = CellCenter(bx), wz1 = CellCenter(bz);
-            float dist = Mathf.Max(Mathf.Abs(wx1 - wx0), Mathf.Abs(wz1 - wz0));
-            int steps = Mathf.Max(1, Mathf.CeilToInt(dist / (CellSize * 0.5f)));
-            for (int s = 1; s < steps; s++)
-            {
-                float t = s / (float)steps;
-                if (CellBlockedWorld(CellOf(Mathf.Lerp(wx0, wx1, t)), CellOf(Mathf.Lerp(wz0, wz1, t))))
-                    return false;
-            }
-            return true;
-        }
-
-        private bool CellBlockedWorld(int cx, int cz)
-        {
-            int gx = cx - m_originX, gz = cz - m_originZ;
-            if (gx < 0 || gx >= GridDim || gz < 0 || gz >= GridDim) return false;
-            return m_cells[gz * GridDim + gx] == Blocked;
-        }
-
-        private Vector3 CellWorld(int gridIdx, float y)
-        {
-            int gx = gridIdx % GridDim, gz = gridIdx / GridDim;
-            return new Vector3(CellCenter(m_originX + gx), y, CellCenter(m_originZ + gz));
-        }
-
-        // ====================================================================
-        //  Occupancy-сетка
-        // ====================================================================
-        public void TickGrid(Vector3 pos)
-        {
-            int cx = CellOf(pos.x), cz = CellOf(pos.z);
-            if (m_originX == int.MinValue ||
-                Mathf.Abs(cx - (m_originX + HalfDim)) > HalfDim / 2 ||
-                Mathf.Abs(cz - (m_originZ + HalfDim)) > HalfDim / 2)
-            {
-                Recenter(cx, cz);
-            }
-
-            if (Time.time - m_lastGridUpdate < GridUpdateInterval) return;
-            m_lastGridUpdate = Time.time;
-
-            if (s_spiral == null) s_spiral = BuildSpiral();
-
-            for (int i = 0; i < CellsPerUpdate; i++)
-            {
-                int o = m_sweepPos * 2;
-                SampleCell(m_originX + s_spiral[o], m_originZ + s_spiral[o + 1]);
-                m_sweepPos = (m_sweepPos + 1) % (s_spiral.Length / 2);
-            }
-        }
-
-        private void Recenter(int cx, int cz)
-        {
-            int newOX = cx - HalfDim, newOZ = cz - HalfDim;
-            if (m_originX == int.MinValue)
-            {
-                for (int i = 0; i < m_cells.Length; i++) m_cells[i] = Unknown;
-            }
-            else
-            {
-                int dx = newOX - m_originX;
-                int dz = newOZ - m_originZ;
-                byte[] src = new byte[m_cells.Length];
-                Array.Copy(m_cells, src, m_cells.Length);
-                for (int z = 0; z < GridDim; z++)
+                float sign = s == 0 ? pref : -pref;
+                foreach (float a in WideAngles)
                 {
-                    int sz = z + dz;
-                    if (sz < 0 || sz >= GridDim) continue;
-                    for (int x = 0; x < GridDim; x++)
+                    Vector3 cand = Quaternion.Euler(0f, a * sign, 0f) * dir;
+                    float free = CastDir(pos, cand, SideRayLength, out _);
+
+                    if (free >= SideRayLength - 0.01f)
                     {
-                        int sx = x + dx;
-                        m_cells[z * GridDim + x] = (sx < 0 || sx >= GridDim) ? Unknown : src[sz * GridDim + sx];
+                        m_wideFreeDir = cand;
+                        m_wideFreeValid = true;
+                        break; // первый свободный широкий коридор достаточен
+                    }
+                    if (free > m_leastFree + 0.5f)
+                    {
+                        m_leastFree = free;
+                        m_leastDir = cand;
+                        m_leastDirValid = true;
                     }
                 }
-            }
-            m_originX = newOX;
-            m_originZ = newOZ;
-            m_sweepPos = 0;
-        }
-
-        private void SampleCell(int cellX, int cellZ)
-        {
-            int gx = cellX - m_originX, gz = cellZ - m_originZ;
-            if (gx < 0 || gx >= GridDim || gz < 0 || gz >= GridDim) return;
-
-            Vector3 center = new Vector3(CellCenter(cellX), 0f, CellCenter(cellZ));
-            m_cells[gz * GridDim + gx] =
-                FootprintPassable(center, m_owner.transform.rotation) ? Free : Blocked;
-        }
-
-        private void MarkAheadBlocked(Vector3 pos, Vector3 dir)
-        {
-            Vector3 p = pos + dir * (FootprintRadius + 0.5f);
-            MarkBlockedArea(new Vector3(p.x, 0f, p.z), 1);
-        }
-
-        private void MarkBlockedArea(Vector3 p, int radius)
-        {
-            int cx = CellOf(p.x), cz = CellOf(p.z);
-            for (int dz = -radius; dz <= radius; dz++)
-                for (int dx = -radius; dx <= radius; dx++)
-                {
-                    int gx = cx + dx - m_originX, gz = cz + dz - m_originZ;
-                    if (gx < 0 || gx >= GridDim || gz < 0 || gz >= GridDim) continue;
-                    m_cells[gz * GridDim + gx] = Blocked;
-                }
-        }
-
-        // ====================================================================
-        //  ВЫПЕЧЕННЫЙ КОНТУР + проходимость (FIX 14b + 15a + 16a)
-        // ====================================================================
-        private void BakeFootprintIfNeeded()
-        {
-            if (m_footVersion == m_owner.PiecesVersion && m_footPoints.Count > 0) return;
-            m_footVersion = m_owner.PiecesVersion;
-
-            Transform t = m_owner.transform;
-            bool any = false;
-            float minX = float.MaxValue, maxX = float.MinValue;
-            float minY = float.MaxValue, maxY = float.MinValue;
-            float minZ = float.MaxValue, maxZ = float.MinValue;
-
-            if (m_owner.AttachedPieces.Count > 0)
-            {
-                Physics.SyncTransforms();
-
-                foreach (var pv in m_owner.AttachedPieces)
-                {
-                    if (pv == null) continue;
-                    foreach (var c in pv.GetComponentsInChildren<Collider>(false))
-                    {
-                        if (c == null || !c.enabled) continue;
-                        Bounds b = c.bounds;
-
-                        if ((b.center - t.position).sqrMagnitude > FootGarbageDist * FootGarbageDist)
-                            continue;
-
-                        for (int i = 0; i < 8; i++)
-                        {
-                            Vector3 corner = new Vector3(
-                                (i & 1) == 0 ? b.min.x : b.max.x,
-                                (i & 2) == 0 ? b.min.y : b.max.y,
-                                (i & 4) == 0 ? b.min.z : b.max.z);
-                            Vector3 l = t.InverseTransformPoint(corner);
-                            if (l.x < minX) minX = l.x;
-                            if (l.x > maxX) maxX = l.x;
-                            if (l.y < minY) minY = l.y;
-                            if (l.y > maxY) maxY = l.y;
-                            if (l.z < minZ) minZ = l.z;
-                            if (l.z > maxZ) maxZ = l.z;
-                        }
-                        any = true;
-                    }
-                }
-            }
-
-            if (!any)
-            {
-                // тролль без платформы: габарит тела
-                minX = -0.9f; maxX = 0.9f;
-                minZ = -0.9f; maxZ = 0.9f;
-                minY = 0.3f; maxY = 4.2f;
-            }
-
-            float cx = Mathf.Clamp((minX + maxX) * 0.5f, -FootMaxCenterOffset, FootMaxCenterOffset);
-            float cz = Mathf.Clamp((minZ + maxZ) * 0.5f, -FootMaxCenterOffset, FootMaxCenterOffset);
-            float hx = Mathf.Min((maxX - minX) * 0.5f, FootMaxHalfExtent);
-            float hz = Mathf.Min((maxZ - minZ) * 0.5f, FootMaxHalfExtent);
-
-            // FIX 16a: клиренс — ниже StepClearance (плюс радиус щупа, чтобы
-            // сфера не доставала до земли) не сканируем НИКОГДА: валуны, пни
-            // и жилы MineRock5 тролль перешагивает.
-            float spanMin = Mathf.Max(minY, StepClearance + DetailProbeRadius);
-            float spanMax = Mathf.Max(maxY, spanMin + 0.6f);
-            if (spanMax - spanMin > 1.8f)
-                m_footHeights = new[] { spanMin + 0.5f, (spanMin + spanMax) * 0.5f };
-            else
-                m_footHeights = new[] { (spanMin + spanMax) * 0.5f };
-            m_footMidY = (spanMin + spanMax) * 0.5f;
-
-            m_footRadius = Mathf.Min(
-                new Vector2(cx, cz).magnitude + Mathf.Sqrt(hx * hx + hz * hz) + 0.15f,
-                FootMaxRadius);
-
-            m_footPoints.Clear();
-            float step = 0.85f;
-            AddEdgePoints(m_footPoints, cx - hx, cx + hx, cz - hz, step, true);
-            AddEdgePoints(m_footPoints, cx - hx, cx + hx, cz + hz, step, true);
-            AddEdgePoints(m_footPoints, cz - hz, cz + hz, cx - hx, step, false);
-            AddEdgePoints(m_footPoints, cz - hz, cz + hz, cx + hx, step, false);
-            m_footPoints.Add(new Vector2(cx - hx, cz - hz));
-            m_footPoints.Add(new Vector2(cx + hx, cz - hz));
-            m_footPoints.Add(new Vector2(cx - hx, cz + hz));
-            m_footPoints.Add(new Vector2(cx + hx, cz + hz));
-        }
-
-        private static void AddEdgePoints(List<Vector2> pts, float from, float to, float fixedV, float step, bool xAxis)
-        {
-            int n = Mathf.Max(1, Mathf.CeilToInt((to - from) / step));
-            for (int i = 0; i <= n; i++)
-            {
-                float v = from + (to - from) * i / n;
-                pts.Add(xAxis ? new Vector2(v, fixedV) : new Vector2(fixedV, v));
+                if (m_wideFreeValid) break;
             }
         }
 
-        // FIX 15a: щупы от реальной высоты земли в проверяемой точке (склоны)
-        public bool FootprintPassable(Vector3 worldPos, Quaternion yaw, List<Collider> blockers = null)
+        // Толстый луч = BoxCast шириной платформы, высотой её спана,
+        // с клиренсом StepClearance (низкие валуны/жилы не видит — перешагиваем).
+        // Возвращает свободную длину (== length, если чисто) и ближайший
+        // ЧУЖОЙ блокатор.
+        private float CastDir(Vector3 pos, Vector3 dir, float length, out Collider blocker)
         {
+            blocker = null;
             BakeFootprintIfNeeded();
-            if (m_footRadius <= 0f) return true;
+            float ground = GroundY(pos);
+            Vector3 origin = new Vector3(pos.x, ground + m_spanMid, pos.z)
+                + dir * (ProbeHalfThick + 0.1f);
+            Vector3 half = new Vector3(m_boxHalfX + SideMargin, m_spanHalf + 0.1f, ProbeHalfThick);
 
-            float groundAtPos = GroundY(worldPos);
+            int n = Physics.BoxCastNonAlloc(origin, half, dir, s_castHits,
+                Quaternion.LookRotation(dir), length, ObstacleMask, QueryTriggerInteraction.Ignore);
 
-            if (!AnyForeign(new Vector3(worldPos.x, groundAtPos + m_footMidY, worldPos.z), m_footRadius + 0.25f))
-                return true;
-
-            bool blocked = false;
-            foreach (Vector2 lp in m_footPoints)
-            {
-                Vector3 off = yaw * new Vector3(lp.x, 0f, lp.y);
-                float px = worldPos.x + off.x;
-                float pz = worldPos.z + off.z;
-
-                float pointGroundY = GroundY(new Vector3(px, 0f, pz));
-
-                foreach (float h in m_footHeights)
-                {
-                    int n = Physics.OverlapSphereNonAlloc(new Vector3(px, pointGroundY + h, pz), DetailProbeRadius, s_hits, ObstacleMask, QueryTriggerInteraction.Ignore);
-                    for (int i = 0; i < n; i++)
-                    {
-                        Collider c = s_hits[i];
-                        if (!IsForeign(c)) continue;
-                        blocked = true;
-                        if (blockers != null && !blockers.Contains(c)) blockers.Add(c);
-                    }
-                }
-                if (blocked && blockers == null)
-                    return false;
-            }
-            return !blocked;
-        }
-
-        private static float GroundY(Vector3 p)
-        {
-            if (ZoneSystem.instance != null)
-            {
-                try
-                {
-                    float gh = ZoneSystem.instance.GetGroundHeight(p);
-                    if (gh > 0f) return gh;
-                }
-                catch { }
-            }
-            return p.y;
-        }
-
-        private bool IsForeign(Collider c)
-        {
-            if (c == null || c.isTrigger) return false;
-            if (c.transform.IsChildOf(m_owner.transform)) return false;
-            Rigidbody ownBody = m_owner.TrollRigidbody;
-            if (ownBody != null && c.attachedRigidbody == ownBody) return false;
-            if (c.GetComponentInParent<TrollPieceTag>() != null) return false;
-            return true;
-        }
-
-        private bool AnyForeign(Vector3 pos, float radius)
-        {
-            int n = Physics.OverlapSphereNonAlloc(pos, radius, s_hits, ObstacleMask, QueryTriggerInteraction.Ignore);
+            float nearest = float.MaxValue;
             for (int i = 0; i < n; i++)
-                if (IsForeign(s_hits[i])) return true;
-            return false;
+            {
+                Collider c = s_castHits[i].collider;
+                if (!IsForeign(c)) continue;
+                if (s_castHits[i].distance < nearest)
+                {
+                    nearest = s_castHits[i].distance;
+                    blocker = c;
+                }
+            }
+            return blocker == null ? length : nearest;
         }
 
         // ====================================================================
-        //  ЛОМАНИЕ (FIX 14a + 15b + 16b + 16c + 16f)
+        //  ЛОМАНИЕ — блокатор главного луча, когда обход малыми углами невозможен
         // ====================================================================
-        // allowFar=false: только то, что перекрывает путь ПРЯМО СЕЙЧАС
-        //                 (щуп 1.3 м — вызывается при провиле верификации).
-        // allowFar=true : тупик частичного пути — ищем стену впереди (3 м).
-        private bool TryStartBreaking(BaseAI ai, Vector3 pos, Vector3 dir, bool allowFar)
+        private bool TryStartBreaking(BaseAI ai, Vector3 pos, Vector3 dir)
         {
             if (m_owner.TrollCharacter == null) return false;
             if (m_owner.TrollCharacter.IsDead()) return false;
-            if (Time.time < m_nextBreakSearch) return false;
-            m_nextBreakSearch = Time.time + BreakSearchInterval;
 
             if (ai.GetTargetCreature() != null)
             {
@@ -932,73 +493,51 @@ namespace TrollBuildingMod
                 return false;
             }
 
-            s_blockers.Clear();
-            FootprintPassable(pos + dir * AheadProbeDist, Quaternion.LookRotation(dir), s_blockers);
+            Collider c = m_forwardBlocker;
+            if (IsDungeonCollider(c)) return false;
 
-            if (allowFar && s_blockers.Count == 0)
-                FootprintPassable(pos + dir * FarProbeDist, Quaternion.LookRotation(dir), s_blockers);
-
-            BreakTarget target = null;
-            float bestD = float.MaxValue;
-            Transform own = m_owner.transform;
-            float maxDist = allowFar ? BreakPickFarMax : BreakPickNearMax;
-            int realBlockers = 0;
-            Collider diagSample = null;
-
-            foreach (Collider c in s_blockers)
+            MonoBehaviour mb = FindBreakableComponent(c);
+            if (mb == null)
             {
-                if (IsDungeonCollider(c)) continue;   // FIX 16c: архитектура данжей
-                realBlockers++;
-                if (diagSample == null) diagSample = c;
-
-                MonoBehaviour mb = FindBreakableComponent(c);
-                if (mb == null) continue;
-
-                // постройки, платформы, существа — НИКОГДА
-                if (mb.GetComponentInParent<Piece>() != null) continue;
-                if (mb.GetComponentInParent<TrollPieceTag>() != null) continue;
-                if (mb.GetComponentInParent<Character>() != null) continue;
-                if (mb.transform.IsChildOf(own)) continue;
-                if (IsRecentlyFailedTree(mb.transform.position)) continue;
-
-                Vector3 cp = ClosestPointOn(c, pos);
-
-                // FIX 15b: цель — только ВПЕРЕДИ по ходу движения
-                Vector3 to = cp - pos;
-                to.y = 0f;
-                if (to.sqrMagnitude < 0.01f) continue;
-                if (Vector3.Dot(dir, to.normalized) < ForwardDotMin) continue;
-
-                float d = Utils.DistanceXZ(cp, pos);
-                if (d > maxDist) continue;
-
-                if (d < bestD)
-                {
-                    bestD = d;
-                    target = new BreakTarget { Comp = mb, Destructible = mb as IDestructible, Pos = cp };
-                }
-            }
-
-            if (target == null)
-            {
-                // FIX 16: диагностика — только про реальные (не данж) блокаторы
-                if (realBlockers > 0 && diagSample != null && Time.time - m_lastDiagLog > DiagLogInterval)
+                if (Time.time - m_lastDiagLog > DiagLogInterval)
                 {
                     m_lastDiagLog = Time.time;
-                    Debug.Log("[TrollBuild] Path blocked by NON-breakable: " +
-                              diagSample.gameObject.name + "/" + LayerMask.LayerToName(diagSample.gameObject.layer));
+                    Debug.Log("[TrollBuild] Ray blocked by NON-breakable: " +
+                              c.gameObject.name + "/" + LayerMask.LayerToName(c.gameObject.layer));
                 }
-                return false; // FIX 16: никаких сообщений игроку отсюда
+                return false;
             }
 
-            m_break = target;
-            m_breakStarted = Time.time;
+            // постройки, платформы, существа — НИКОГДА
+            if (mb.GetComponentInParent<Piece>() != null) return false;
+            if (mb.GetComponentInParent<TrollPieceTag>() != null) return false;
+            if (mb.GetComponentInParent<Character>() != null) return false;
+            if (mb.transform.IsChildOf(m_owner.transform)) return false;
+            if (IsRecentlyFailedTree(mb.transform.position)) return false;
+
+            Vector3 cp = ClosestPointOn(c, pos);
+
+            // цель — только впереди по ходу движения
+            Vector3 to = cp - pos;
+            to.y = 0f;
+            if (to.sqrMagnitude < 0.01f) return false;
+            if (Vector3.Dot(dir, to.normalized) < ForwardDotMin) return false;
+
+            float d = Utils.DistanceXZ(cp, pos);
+            if (d > BreakPickMax) return false;
+
+            m_break = new BreakTarget
+            {
+                Comp = mb,
+                Destructible = mb as IDestructible,
+                Pos = cp
+            };
             m_lastLandedSwing = Time.time;
             m_nextSwing = 0f;
             m_swingCount = 0;
 
-            Debug.Log($"[TrollBuild] Break START: '{target.Comp.gameObject.name}' " +
-                      $"({target.Comp.GetType().Name}) closestPointDist={bestD:F1}");
+            Debug.Log($"[TrollBuild] Break START: '{mb.gameObject.name}' " +
+                      $"({mb.GetType().Name}) dist={d:F1} (no free rays)");
 
             if (Time.time - m_lastTreeMsg > 10f)
             {
@@ -1022,8 +561,8 @@ namespace TrollBuildingMod
             return c.bounds.ClosestPoint(to);
         }
 
-        // FIX 16b: БЕЗ MineRock/MineRock5 — жилы и валуны тролль перешагивает
-        // (клиренс 16a) и не тратит время на их долбёжку.
+        // БЕЗ MineRock/MineRock5 — низкое перешагивается (клиренс),
+        // высокое объезжается веером.
         private static MonoBehaviour FindBreakableComponent(Collider c)
         {
             Component comp = c.GetComponentInParent<TreeBase>();
@@ -1046,42 +585,36 @@ namespace TrollBuildingMod
         {
             if (IsRecentlyFailedTree(p)) return;
             m_failedTreePos.Add(p);
-            m_failedTreeTime.Add(Time.time);
-            if (m_failedTreePos.Count > 16)
-            {
-                m_failedTreePos.RemoveAt(0);
-                m_failedTreeTime.RemoveAt(0);
-            }
+            if (m_failedTreePos.Count > 16) m_failedTreePos.RemoveAt(0);
         }
 
         private bool UpdateBreaking(BaseAI ai, float dt)
         {
+            // бой важнее ломания
             if (ai.GetTargetCreature() != null)
             {
                 m_break = null;
-                m_hasPlan = false;
                 return false;
             }
 
+            // цель исчезла (повалена) — лучи пересчитаются, маршрут продолжится
             if (m_break == null || m_break.Comp == null || !m_break.Comp)
             {
                 Debug.Log("[TrollBuild] Break: target gone, resuming route");
                 m_break = null;
-                m_hasPlan = false;
-                m_sweepPos = 0;
+                m_lastCast = -1f; // форсируем немедленный пересчёт лучей
                 return false;
             }
 
+            // таймаут от последнего НАНЕСЁННОГО удара
             if (Time.time - m_lastLandedSwing > BreakTimeout)
             {
                 Debug.Log($"[TrollBuild] Break TIMEOUT on '{m_break.Comp.gameObject.name}' " +
                           $"after {m_swingCount} swings");
                 RememberFailedTree(m_break.Pos);
-                MarkBlockedArea(new Vector3(m_break.Pos.x, 0f, m_break.Pos.z), 2);
                 m_break = null;
-                m_hasPlan = false;
-                m_nextPlanAllowed = Time.time + 0.5f;
-                NotifyBlocked();
+                m_steerSide = -m_steerSide; // при простое пробуем другую сторону
+                m_lastCast = -1f;
                 return false;
             }
 
@@ -1133,14 +666,183 @@ namespace TrollBuildingMod
         }
 
         // ====================================================================
-        //  Гейт поворота
+        //  Простой: сообщение ТОЛЬКО по факту стояния; смена стороны объезда
+        // ====================================================================
+        private void TrackStall(Vector3 pos, float dt)
+        {
+            if (Utils.DistanceXZ(pos, m_lastStallPos) < 0.15f)
+            {
+                m_stallTimer += dt;
+
+                // раз в StallSideFlip секунд простоя — пробуем другую сторону
+                if (m_stallTimer - m_lastFlipMark > StallSideFlip)
+                {
+                    m_lastFlipMark = m_stallTimer;
+                    m_steerSide = -m_steerSide;
+                    m_lastCast = -1f; // немедленный пересчёт лучей с новой стороны
+                }
+
+                if (m_stallTimer > StallMsgTime)
+                {
+                    m_stallTimer = 0f;
+                    m_lastFlipMark = 0f;
+                    NotifyBlocked();
+                }
+            }
+            else
+            {
+                m_stallTimer = 0f;
+                m_lastFlipMark = 0f;
+                m_lastStallPos = pos;
+            }
+        }
+
+        private void NotifyBlocked()
+        {
+            if (Time.time - m_lastBlockedMsg < 15f) return;
+            m_lastBlockedMsg = Time.time;
+            Player.m_localPlayer?.Message(MessageHud.MessageType.TopLeft,
+                TrollWalkLoc.T("The troll cannot squeeze through with its platform",
+                    "Тролль не может протиснуться с платформой"), 0, null, false);
+        }
+
+        // ====================================================================
+        //  ВЫПЕЧЕННЫЙ ГАБАРИТ (ширина луча + контур для гейта поворота)
+        // ====================================================================
+        private void BakeFootprintIfNeeded()
+        {
+            if (m_footVersion == m_owner.PiecesVersion && m_footPoints.Count > 0) return;
+            m_footVersion = m_owner.PiecesVersion;
+
+            Transform t = m_owner.transform;
+            bool any = false;
+            float minX = float.MaxValue, maxX = float.MinValue;
+            float minY = float.MaxValue, maxY = float.MinValue;
+            float minZ = float.MaxValue, maxZ = float.MinValue;
+
+            Physics.SyncTransforms(); // защита от протухших bounds
+
+            foreach (var pv in m_owner.AttachedPieces)
+            {
+                if (pv == null) continue;
+                foreach (var c in pv.GetComponentsInChildren<Collider>(false))
+                {
+                    if (c == null || !c.enabled) continue;
+                    Bounds b = c.bounds;
+
+                    if ((b.center - t.position).sqrMagnitude > FootGarbageDist * FootGarbageDist)
+                        continue;
+
+                    for (int i = 0; i < 8; i++)
+                    {
+                        Vector3 corner = new Vector3(
+                            (i & 1) == 0 ? b.min.x : b.max.x,
+                            (i & 2) == 0 ? b.min.y : b.max.y,
+                            (i & 4) == 0 ? b.min.z : b.max.z);
+                        Vector3 l = t.InverseTransformPoint(corner);
+                        if (l.x < minX) minX = l.x;
+                        if (l.x > maxX) maxX = l.x;
+                        if (l.y < minY) minY = l.y;
+                        if (l.y > maxY) maxY = l.y;
+                        if (l.z < minZ) minZ = l.z;
+                        if (l.z > maxZ) maxZ = l.z;
+                    }
+                    any = true;
+                }
+            }
+
+            if (!any)
+            {
+                minX = -0.9f; maxX = 0.9f;
+                minZ = -0.9f; maxZ = 0.9f;
+                minY = 0.3f; maxY = 4.2f;
+            }
+
+            float cx = Mathf.Clamp((minX + maxX) * 0.5f, -FootMaxCenterOffset, FootMaxCenterOffset);
+            float cz = Mathf.Clamp((minZ + maxZ) * 0.5f, -FootMaxCenterOffset, FootMaxCenterOffset);
+            float hx = Mathf.Min((maxX - minX) * 0.5f, FootMaxHalfExtent);
+            float hz = Mathf.Min((maxZ - minZ) * 0.5f, FootMaxHalfExtent);
+
+            // клиренс: ниже StepClearance лучи не смотрят никогда
+            m_spanMin = Mathf.Max(minY, StepClearance);
+            m_spanMax = Mathf.Max(maxY, m_spanMin + 0.6f);
+            m_spanMid = (m_spanMin + m_spanMax) * 0.5f;
+            m_spanHalf = (m_spanMax - m_spanMin) * 0.5f;
+
+            m_boxHalfX = hx;
+
+            m_footRadius = Mathf.Min(
+                new Vector2(cx, cz).magnitude + Mathf.Sqrt(hx * hx + hz * hz) + 0.15f,
+                FootMaxRadius);
+
+            if (m_spanMax - m_spanMin > 1.8f)
+                m_footHeights = new[] { m_spanMin + 0.5f, m_spanMid };
+            else
+                m_footHeights = new[] { m_spanMid };
+
+            m_footPoints.Clear();
+            float step = 0.85f;
+            AddEdgePoints(m_footPoints, cx - hx, cx + hx, cz - hz, step, true);
+            AddEdgePoints(m_footPoints, cx - hx, cx + hx, cz + hz, step, true);
+            AddEdgePoints(m_footPoints, cz - hz, cz + hz, cx - hx, step, false);
+            AddEdgePoints(m_footPoints, cz - hz, cz + hz, cx + hx, step, false);
+            m_footPoints.Add(new Vector2(cx - hx, cz - hz));
+            m_footPoints.Add(new Vector2(cx + hx, cz - hz));
+            m_footPoints.Add(new Vector2(cx - hx, cz + hz));
+            m_footPoints.Add(new Vector2(cx + hx, cz + hz));
+        }
+
+        private static void AddEdgePoints(List<Vector2> pts, float from, float to, float fixedV, float step, bool xAxis)
+        {
+            int n = Mathf.Max(1, Mathf.CeilToInt((to - from) / step));
+            for (int i = 0; i <= n; i++)
+            {
+                float v = from + (to - from) * i / n;
+                pts.Add(xAxis ? new Vector2(v, fixedV) : new Vector2(fixedV, v));
+            }
+        }
+
+        private static float GroundY(Vector3 p)
+        {
+            if (ZoneSystem.instance != null)
+            {
+                try
+                {
+                    float gh = ZoneSystem.instance.GetGroundHeight(p);
+                    if (gh > 0f) return gh;
+                }
+                catch { }
+            }
+            return p.y;
+        }
+
+        private bool IsForeign(Collider c)
+        {
+            if (c == null || c.isTrigger) return false;
+            if (c.transform.IsChildOf(m_owner.transform)) return false;
+            Rigidbody ownBody = m_owner.TrollRigidbody;
+            if (ownBody != null && c.attachedRigidbody == ownBody) return false;
+            if (c.GetComponentInParent<TrollPieceTag>() != null) return false;
+            return true;
+        }
+
+        private bool AnyForeign(Vector3 pos, float radius)
+        {
+            int n = Physics.OverlapSphereNonAlloc(pos, radius, s_hits, ObstacleMask, QueryTriggerInteraction.Ignore);
+            for (int i = 0; i < n; i++)
+                if (IsForeign(s_hits[i])) return true;
+            return false;
+        }
+
+        // ====================================================================
+        //  Гейт поворота (контур из выпечки; работает во всех режимах)
         // ====================================================================
         public bool HasNearbyForeign()
         {
             BakeFootprintIfNeeded();
             if (m_footRadius <= 0f) return false;
             Vector3 pos = m_owner.transform.position;
-            return AnyForeign(new Vector3(pos.x, pos.y + m_footMidY, pos.z), m_footRadius + 1f);
+            return AnyForeign(new Vector3(pos.x, pos.y + m_spanMid, pos.z), m_footRadius + 1f);
         }
 
         public bool RotationStepBlocked(Vector3 pos, Quaternion candidate)
@@ -1157,112 +859,6 @@ namespace TrollBuildingMod
                 }
             }
             return false;
-        }
-
-        // ====================================================================
-        //  Анти-застревание (FIX 16: сообщение — ТОЛЬКО отсюда)
-        // ====================================================================
-        private void TrackStuck(Vector3 pos, float dt)
-        {
-            if (Utils.DistanceXZ(pos, m_lastStuckPos) < 0.15f)
-            {
-                m_stuckTimer += dt;
-                if (m_stuckTimer > StuckTime)
-                {
-                    m_stuckTimer = 0f;
-                    m_hasPlan = false;
-                    m_nextPlanAllowed = 0f;
-                    m_sweepPos = 0;
-                    m_failStreak++;
-                    if (m_failStreak >= MaxFailStreak)
-                    {
-                        m_failStreak = 0;
-                        m_nextPlanAllowed = Time.time + FailCooldown;
-                        NotifyBlocked();
-                    }
-                }
-            }
-            else
-            {
-                m_stuckTimer = 0f;
-                m_lastStuckPos = pos;
-                m_failStreak = 0;
-            }
-        }
-
-        private void NotifyBlocked()
-        {
-            if (Time.time - m_lastBlockedMsg < 15f) return;
-            m_lastBlockedMsg = Time.time;
-            Player.m_localPlayer?.Message(MessageHud.MessageType.TopLeft,
-                TrollWalkLoc.T("The troll cannot squeeze through with its platform",
-                    "Тролль не может протиснуться с платформой"), 0, null, false);
-        }
-
-        // ====================================================================
-        //  Вспомогательное
-        // ====================================================================
-        private static int CellOf(float w) => Mathf.FloorToInt(w / CellSize);
-        private static float CellCenter(int c) => (c + 0.5f) * CellSize;
-
-        private static int[] BuildSpiral()
-        {
-            int count = GridDim * GridDim;
-            int[] xs = new int[count], zs = new int[count], ds = new int[count];
-            int i = 0;
-            for (int dz = -HalfDim; dz < HalfDim; dz++)
-                for (int dx = -HalfDim; dx < HalfDim; dx++)
-                {
-                    xs[i] = dx; zs[i] = dz; ds[i] = dx * dx + dz * dz; i++;
-                }
-            int[] idx = new int[count];
-            for (int k = 0; k < count; k++) idx[k] = k;
-            Array.Sort(idx, (a, b) => ds[a].CompareTo(ds[b]));
-            int[] flat = new int[count * 2];
-            for (int k = 0; k < count; k++)
-            {
-                flat[k * 2] = xs[idx[k]];
-                flat[k * 2 + 1] = zs[idx[k]];
-            }
-            return flat;
-        }
-
-        private void HeapPush(int node, float f)
-        {
-            if (m_heapCount >= HeapCapacity) return;
-            int i = m_heapCount++;
-            m_heap[i] = node; m_heapF[i] = f;
-            while (i > 0)
-            {
-                int p = (i - 1) >> 1;
-                if (m_heapF[p] <= m_heapF[i]) break;
-                int tn = m_heap[p]; m_heap[p] = m_heap[i]; m_heap[i] = tn;
-                float tf = m_heapF[p]; m_heapF[p] = m_heapF[i]; m_heapF[i] = tf;
-                i = p;
-            }
-        }
-
-        private int HeapPop()
-        {
-            int result = m_heap[0];
-            m_heapCount--;
-            if (m_heapCount > 0)
-            {
-                m_heap[0] = m_heap[m_heapCount];
-                m_heapF[0] = m_heapF[m_heapCount];
-                int i = 0;
-                for (; ; )
-                {
-                    int l = i * 2 + 1, r = l + 1, s = i;
-                    if (l < m_heapCount && m_heapF[l] < m_heapF[s]) s = l;
-                    if (r < m_heapCount && m_heapF[r] < m_heapF[s]) s = r;
-                    if (s == i) break;
-                    int tn = m_heap[s]; m_heap[s] = m_heap[i]; m_heap[i] = tn;
-                    float tf = m_heapF[s]; m_heapF[s] = m_heapF[i]; m_heapF[i] = tf;
-                    i = s;
-                }
-            }
-            return result;
         }
     }
 
@@ -1602,11 +1198,6 @@ namespace TrollBuildingMod
             try { UpdatePlatformRecovery(); }
             catch (Exception e) { Debug.LogWarning("[TrollBuild] Platform recovery failed: " + e.Message); }
 
-            // FIX 14c: сетка тикает и для приручённых троллей БЕЗ платформы
-            // (дикие не тикают — они и так ходят ванилью).
-            if (m_attachedPieces.Count > 0 || (TrollCharacter != null && TrollCharacter.IsTamed()))
-                Navigator.TickGrid(transform.position);
-
             if (m_buildRoot != null && m_buildRoot.parent == transform && m_boneUpgradeAttempts < MaxBoneUpgradeAttempts)
             {
                 m_boneUpgradeTimer -= Time.fixedDeltaTime;
@@ -1831,7 +1422,7 @@ namespace TrollBuildingMod
         }
 
         // ================================================================
-        //  Гейт поворота
+        //  Гейт поворота (работает во всех режимах при наличии построек)
         // ================================================================
         public void LimitTurnSpeedForPlatform(ref float turnSpeed, float dt)
         {
@@ -2342,10 +1933,9 @@ namespace TrollBuildingMod
         }
 
         // ================================================================
-        //  ГЛАВНЫЙ патч навигации.
-        //  FIX 14c: приручённые тролли БЕЗ платформы тоже идут через
-        //  планировщик (габарит = тело) и ломают препятствия.
-        //  Дикие тролли без платформы — строго ваниль.
+        //  FIX 17a: ГИБРИДНЫЙ ГЕЙТ. Навигатор и ломание — ТОЛЬКО в режиме
+        //  маршрута TrollWalk (ZDO-флаг) и ТОЛЬКО при наличии построек.
+        //  Следование/охрана/idle/дикий тролль/без платформы — чистая ваниль.
         // ================================================================
         [HarmonyPatch(typeof(BaseAI), "MoveTo")]
         [HarmonyPrefix]
@@ -2359,18 +1949,34 @@ namespace TrollBuildingMod
                 TrollPiecesContainer container = __instance.GetComponent<TrollPiecesContainer>();
                 if (container == null) return true;
 
-                if (container.PieceCount == 0 &&
-                    (container.TrollCharacter == null || !container.TrollCharacter.IsTamed()))
-                    return true; // дикий тролль без платформы — ваниль
+                if (container.PieceCount == 0) return true; // без платформы — ваниль
+
+                if (!IsRouteActive(container))
+                {
+                    container.Navigator.OnRouteEnded(); // маршрут кончился — сброс ломания
+                    return true; // следование/охрана — чистая ваниль
+                }
 
                 __result = container.Navigator.DriveMoveTo(__instance, dt, point, dist, run);
                 return false;
             }
             catch (Exception e)
             {
-                Debug.LogWarning("[TrollBuild] Platform MoveTo failed, falling back to vanilla: " + e.Message);
+                Debug.LogWarning("[TrollBuild] Hybrid MoveTo failed, falling back to vanilla: " + e.Message);
                 return true;
             }
+        }
+
+        private static bool IsRouteActive(TrollPiecesContainer container)
+        {
+            try
+            {
+                ZNetView nv = container.GetComponent<ZNetView>();
+                if (nv == null || !nv.IsValid()) return false;
+                ZDO zdo = nv.GetZDO();
+                return zdo != null && zdo.GetBool(TrollWalkConstants.HashActive, false);
+            }
+            catch { return false; }
         }
 
         [HarmonyPatch(typeof(Player), "PieceRayTest")]
