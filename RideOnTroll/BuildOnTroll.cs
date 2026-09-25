@@ -15,24 +15,27 @@ using UnityEngine.Rendering;
 //  FIX 4: TrollPieceZdoIndex не индексирует самих троллей.
 //  FIX 5: Attach не привязывает существ.
 //  FIX 6: пересчёт поддержки отключён при выгрузке сцены.
-//  FIX 9..18: итерации платформенной навигации (сетка -> лучи -> гибрид).
 //  FIX 13: восстановление потерянной платформы (телепорт задирак).
 //
-//  FIX 19 (текущее, ЕДИНАЯ ЛОГИКА ДВИЖЕНИЯ):
-//   19a. Ваниль ведёт ВСЕГДА — и с платформой, и без (pathfinding, обход
-//        углов, idle, следование — родные). Хук BaseAI.MoveTo удалён.
-//   19b. Мод изгибает направление КАЖДОГО шага (патч BaseAI.MoveTowards):
-//        шаг чист -> не трогаем (поведение = тролль без платформы);
-//        заденет -> отклонение ±12/25/40° (гистерезис стороны).
-//   19c. Ломание — ТОЛЬКО при фронтальной стене (все отклонения заняты)
-//        и ТОЛЬКО в режиме маршрута TrollWalk. Подход в упор + удары.
-//   19d. Неразрушимая стена -> широкий веер 55..100°, наименее перекрытое
-//        направление: тролль скользит вдоль, НИКОГДА не стоит на месте.
-//   19e. Клиренс 1.4 м: валуны/жилы/пни перешагиваются. MineRock не
-//        ломаем. Коллайдеры данжей — не цели ломания.
-//   19f. Рантайм: BoxCast каждые 0.12 с вдоль текущего шага + кэш решения;
-//        прогрузившиеся объекты учитываются автоматически.
-//   19g. Сообщение «не протиснуться» — только по факту простоя ≥ 6 с.
+//  FIX 19 (ЕДИНАЯ ЛОГИКА ДВИЖЕНИЯ):
+//   19a. Ваниль ведёт ВСЕГДА — и с платформой, и без. Хук BaseAI.MoveTo
+//        удалён; перехватывается только BaseAI.MoveTowards.
+//   19b. Мод изгибает направление шага, если платформа заденет препятствие
+//        (BoxCast вдоль шага + отклонения 12/25/40° с гистерезисом).
+//   19c. Ломание — ТОЛЬКО при фронтальной стене и ТОЛЬКО в режиме маршрута.
+//   19d. Неразрушимая стена -> широкий веер 55..100°, скольжение вдоль.
+//   19e. Клиренс 1.4 м; MineRock не ломаем; данжи — не цели ломания.
+//   19f. Рантайм: BoxCast каждые 0.12 с + кэш решения.
+//   19g. Сообщение «не протиснуться» — только по простою >= 6 с.
+//
+//  FIX 20 (СЛЕПАЯ ЗОНА BoxCast — «упёрся, но не видит»):
+//   20a. BoxCast не детектит коллайдеры, которые бокс УЖЕ перекрывает
+//        (ёлка, в которую платформа вдавлена поворотом). Если ваниль
+//        приказывает идти, а тело почти не движется >= 0.9 с — сканируем
+//        OverlapBox-ом объём САМОЙ платформы (FindPressedBlocker) и ломаем
+//        найденное (режим маршрута, белый список ломания — как обычно).
+//   20b. На ходу проверка бесплатна (одно сравнение скорости). Вдавление в
+//        неразрушимое -> обычный широкий веер + сообщение по таймеру.
 // ============================================================================
 namespace TrollBuildingMod
 {
@@ -153,10 +156,12 @@ namespace TrollBuildingMod
     }
 
     // ========================================================================
-    //  ЕДИНЫЙ НАВИГАТОР (FIX 19)
+    //  ЕДИНЫЙ НАВИГАТОР (FIX 19 + FIX 20)
     //  Ваниль ведёт ВСЕГДА. Мод изгибает направление шага (MoveTowards), если
-    //  платформа заденет препятствие; при фронтальной стене (только в
-    //  режиме маршрута) — ломает блокатор. Стоп-веток нет.
+    //  платформа заденет препятствие; при фронтальной стене (только в режиме
+    //  маршрута) — ломает блокатор. Если платформа УЖЕ вдавлена в
+    //  препятствие (слепая зона BoxCast) — детект по простою + OverlapBox.
+    //  Стоп-веток нет.
     // ========================================================================
     public class TrollPlatformNavigator
     {
@@ -183,6 +188,11 @@ namespace TrollBuildingMod
         private const float StallMsgTime = 6f;
         private const float StallSideFlip = 3f;       // смена стороны при простое
         private const float DiagLogInterval = 3f;
+
+        // FIX 20: слепая зона BoxCast (препятствие уже перекрыто платформой)
+        private const float PressTime = 0.9f;         // «идём, но стоим» до скана объёма
+        private const float PressSpeed = 0.35f;      // порог «почти не движемся», м/с
+        private const float PressedMinDot = -0.25f;  // вдавленное может быть сбоку
 
         // габарит
         private const float DetailProbeRadius = 0.75f;
@@ -238,13 +248,15 @@ namespace TrollBuildingMod
         private Vector3 m_cacheOut;
         private float m_cacheTime;
 
-        private int m_steerSide;                 // гистерезис стороны (—1/0/+1)
+        private int m_steerSide;                 // гистерезис стороны (-1/0/+1)
         private float m_stallTimer;
         private float m_stallFlipMark;
         private Vector3 m_lastStallPos;
         private float m_lastBlockedMsg = -30f;
         private float m_lastTreeMsg = -30f;
         private float m_lastDiagLog = -30f;
+
+        private float m_pressTimer;              // FIX 20
 
         // ломание
         private BreakTarget m_break;
@@ -260,6 +272,7 @@ namespace TrollBuildingMod
         private float[] m_footHeights = { 3f };
         private float m_footRadius = 0f;
         private float m_boxHalfX = 1.5f;
+        private float m_boxHalfZ = 1.5f;         // FIX 20
         private float m_spanMin = 2f;
         private float m_spanMax = 4.5f;
         private float m_spanMid = 3.2f;
@@ -293,6 +306,16 @@ namespace TrollBuildingMod
             flat.Normalize();
 
             if (m_break != null)
+            {
+                HandleBreaking(ai, ref dir);
+                TrackStall(ai);
+                return;
+            }
+
+            // FIX 20: платформа УЖЕ перекрыла препятствие (упёрлась/вдавлена
+            // поворотом) — BoxCast такие коллайдеры не видит. Если приказано
+            // идти, а тело почти не движется — сканируем объём платформы.
+            if (CheckPressed(ai, flat))
             {
                 HandleBreaking(ai, ref dir);
                 TrackStall(ai);
@@ -419,8 +442,7 @@ namespace TrollBuildingMod
             to.y = 0f;
             float d = to.magnitude;
 
-            // направляем тролля к цели ломания (не нулевой вектор — защита от
-            // NaN в ванильном MoveTowards); в радиусе удара дерево само
+            // направляем тролля к цели ломания; в радиусе удара дерево само
             // удержит тело, тролль прижимается к нему и бьёт
             if (d > 0.05f)
                 dir = to / d;
@@ -446,7 +468,79 @@ namespace TrollBuildingMod
             }
         }
 
-        private bool TryStartBreaking(BaseAI ai, Vector3 pos, Vector3 dir, Collider c)
+        // ====================================================================
+        //  FIX 20: детект «упёрлись, но каст слепой».
+        //  Возвращает true, если начали ломание перекрытого препятствия.
+        // ====================================================================
+        private bool CheckPressed(BaseAI ai, Vector3 dir)
+        {
+            if (m_break != null) return false;
+            if (!IsRouteActive()) { m_pressTimer = 0f; return false; } // ломание — только маршрут
+
+            Rigidbody rb = m_owner.TrollRigidbody;
+            if (rb == null) return false;
+
+            Vector3 vel = rb.linearVelocity;
+            vel.y = 0f;
+            if (vel.sqrMagnitude > PressSpeed * PressSpeed)
+            {
+                m_pressTimer = 0f; // реально едем — ничего не делаем
+                return false;
+            }
+
+            m_pressTimer += Time.deltaTime;
+            if (m_pressTimer < PressTime) return false;
+            m_pressTimer = 0f; // повтор скана каждые PressTime секунд простоя
+
+            Collider pressed = FindPressedBlocker(ai);
+            if (pressed == null) return false;
+
+            if (Time.time - m_lastDiagLog > DiagLogInterval)
+            {
+                m_lastDiagLog = Time.time;
+                Debug.Log($"[TrollBuild] PRESSED into '{pressed.gameObject.name}' " +
+                          "(inside platform volume, cast-blind) — trying to break");
+            }
+
+            if (TryStartBreaking(ai, ai.transform.position, dir, pressed, PressedMinDot))
+            {
+                m_cacheValid = false;
+                return true;
+            }
+            return false;
+        }
+
+        // Что ЧУЖОЕ находится прямо сейчас внутри объёма платформы.
+        // Единственный способ увидеть препятствие, которое платформа уже
+        // перекрыла (BoxCast такие коллайдеры не детектит).
+        private Collider FindPressedBlocker(BaseAI ai)
+        {
+            BakeFootprintIfNeeded();
+            Vector3 pos = ai.transform.position;
+            float ground = GroundY(pos);
+
+            Quaternion yaw = Quaternion.Euler(0f, ai.transform.eulerAngles.y, 0f);
+            Vector3 center = new Vector3(pos.x, ground + m_spanMid, pos.z);
+            Vector3 half = new Vector3(m_boxHalfX + 0.3f, m_spanHalf + 0.2f, m_boxHalfZ + 0.3f);
+
+            int n = Physics.OverlapBoxNonAlloc(center, half, s_hits, yaw, ObstacleMask, QueryTriggerInteraction.Ignore);
+            Collider best = null;
+            float bestDist = float.MaxValue;
+            for (int i = 0; i < n; i++)
+            {
+                Collider c = s_hits[i];
+                if (!IsForeign(c)) continue;
+                if (IsDungeonCollider(c)) continue;
+                float d = Utils.DistanceXZ(ClosestPointOn(c, pos), pos);
+                if (d < bestDist) { bestDist = d; best = c; }
+            }
+            return best;
+        }
+
+        // ====================================================================
+        //  ЛОМАНИЕ: старт (фронтальная стена либо вдавленное препятствие)
+        // ====================================================================
+        private bool TryStartBreaking(BaseAI ai, Vector3 pos, Vector3 dir, Collider c, float minDot = ForwardDotMin)
         {
             if (m_owner.TrollCharacter == null) return false;
             if (m_owner.TrollCharacter.IsDead()) return false;
@@ -476,7 +570,8 @@ namespace TrollBuildingMod
             Vector3 to = cp - pos;
             to.y = 0f;
             if (to.sqrMagnitude < 0.01f) return false;
-            if (Vector3.Dot(dir, to.normalized) < ForwardDotMin) return false;
+            // для вдавленного препятствия угол может быть боковым — мягкий порог
+            if (Vector3.Dot(dir, to.normalized) < minDot) return false;
 
             float d = Utils.DistanceXZ(cp, pos);
             if (d > BreakPickMax) return false;
@@ -529,6 +624,8 @@ namespace TrollBuildingMod
         //  Толстый луч = BoxCast шириной платформы, с клиренсом StepClearance
         //  (низкие валуны/жилы не видит — перешагиваем). Возвращает свободную
         //  длину (== length, если чисто) и ближайший ЧУЖОЙ блокатор.
+        //  ВНИМАНИЕ: коллайдеры, которые бокс УЖЕ перекрывает в стартовой
+        //  позиции, BoxCast не видит — для них есть CheckPressed (FIX 20).
         // ====================================================================
         private float CastDir(Vector3 pos, Vector3 dir, float length, out Collider blocker)
         {
@@ -725,6 +822,7 @@ namespace TrollBuildingMod
             m_spanHalf = (m_spanMax - m_spanMin) * 0.5f;
 
             m_boxHalfX = hx;
+            m_boxHalfZ = hz; // FIX 20
 
             m_footRadius = Mathf.Min(
                 new Vector2(cx, cz).magnitude + Mathf.Sqrt(hx * hx + hz * hz) + 0.15f,
@@ -1893,7 +1991,8 @@ namespace TrollBuildingMod
         //  Мод лишь ИЗГИБАЕТ направление шага (MoveTowards — единственная
         //  точка любого AI-движения), если платформа заденет препятствие;
         //  ломает блокатор только при фронтальной стене и только в режиме
-        //  маршрута TrollWalk.
+        //  маршрута TrollWalk. FIX 20 внутри навигатора ловит случай,
+        //  когда платформа УЖЕ вдавлена в препятствие (слепая зона каста).
         // ================================================================
         [HarmonyPatch(typeof(BaseAI), "MoveTowards")]
         [HarmonyPrefix]
