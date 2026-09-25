@@ -10,10 +10,26 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Remove="icon\menu\forest.png" />
+    <None Remove="icon\menu\map.png" />
+    <None Remove="icon\menu\stone.png" />
+    <None Remove="icon\menu\stone\copper.png" />
+    <None Remove="icon\menu\stone\stone.png" />
+    <None Remove="icon\menu\wood\CoreWood.png" />
+    <None Remove="icon\menu\wood\FineWood.png" />
+    <None Remove="icon\menu\wood\Wood.png" />
     <None Remove="icon\road.png" />
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="icon\menu\forest.png" />
+    <EmbeddedResource Include="icon\menu\map.png" />
+    <EmbeddedResource Include="icon\menu\stone.png" />
+    <EmbeddedResource Include="icon\menu\stone\copper.png" />
+    <EmbeddedResource Include="icon\menu\stone\stone.png" />
+    <EmbeddedResource Include="icon\menu\wood\CoreWood.png" />
+    <EmbeddedResource Include="icon\menu\wood\FineWood.png" />
+    <EmbeddedResource Include="icon\menu\wood\Wood.png" />
     <EmbeddedResource Include="icon\road.png" />
     <EmbeddedResource Include="icon\troll.png" />
   </ItemGroup>
