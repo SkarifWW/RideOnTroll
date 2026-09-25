@@ -8,15 +8,27 @@ using UnityEngine;
 using UnityEngine.UI;
 
 // ============================================================================
-//  MENU.CS v5 — Радиальное меню (в стиле ванильного) + добыча ресурсов.
+//  MENU.CS v8 — Радиальное меню (в стиле ванильного) + добыча ресурсов.
 //
 //  Y на тролле — открыть. Верх: Не двигаться | Лево: Лес | Право: Камень | Низ: Маршрут
-//  ЛКМ — выбрать, ПКМ / Y / Esc — закрыть.
+//  Наведение на Лес/Камень (0.15с) раскрывает подпункты. ЛКМ — выбор.
+//  ПКМ / Y / Esc — закрыть. Иконки — Embedded Resources.
 //
-//  ДОБЫЧА: цель выбирается ПО ТАБЛИЦЕ ДРОПА объекта (DropOnDestroyed /
-//  m_dropList) — какой предмет реально выпадает, тот и добывается.
-//  Имя префаба используется только как запасной вариант. Дроп-таблицы
-//  кэшируются по префабу.
+//  ДОБЫЧА:
+//   - цель подбирается ПО ТАБЛИЦЕ ДРОПА (все DropOnDestroyed + собственные
+//     таблицы компонента, БЕЗ break);
+//   - урон ЧЕРЕЗ СТАНДАРТНЫЙ IDestructible.Damage(HitData):
+//       * деревья  — общий m_damage;
+//       * камни/руды — урон КИРКИ (m_pickaxe) + toolTier 4 (иначе урон 0);
+//       * hit.m_point = ближайшая точка поверхности + 0.3м внутрь —
+//         игра САМА выбирает зону удара MineRock5 по координате;
+//   - дистанция/точка — до ПОВЕРХНОСТИ коллайдера;
+//   - прогресс-контроль ТОЛЬКО в фазе подхода;
+//   - урон по таймеру, StartAttack — только визуал;
+//   - старт сбрасывает следование (+ патч BaseAI.Follow);
+//   - поворот к цели в фазе удара;
+//   - поиск только при отсутствии цели (кулдаун 3с);
+//   - ванильная команда отменяет работу.
 // ============================================================================
 namespace TrollTamerMod
 {
@@ -42,11 +54,8 @@ namespace TrollTamerMod
     // ================================================================
     internal static class TrollResourceMatcher
     {
-        // кэш: префаб -> имена предметов дропа (null = дропа нет)
         private static readonly Dictionary<string, string[]> s_dropCache =
             new Dictionary<string, string[]>();
-
-        // кэш: тип|префаб -> подходит ли
         private static readonly Dictionary<string, bool> s_matchCache =
             new Dictionary<string, bool>();
 
@@ -81,7 +90,6 @@ namespace TrollTamerMod
             }
         }
 
-        // Разрушаемый компонент на коллайдере (дерево/бревно/руда/деструктибл)
         public static MonoBehaviour FindDestructible(Collider c)
         {
             Component comp = c.GetComponentInParent<TreeBase>();
@@ -94,7 +102,6 @@ namespace TrollTamerMod
             return null;
         }
 
-        // Имя префаба через ZNetView — не зависит от имени коллайдера
         public static string GetRootPrefabName(Component c)
         {
             try
@@ -130,9 +137,6 @@ namespace TrollTamerMod
             string token = ItemTokenFor(type);
             if (string.IsNullOrEmpty(token)) return false;
 
-            // 1) ИСТИНА В ПОСЛЕДНЕЙ ИНСТАНЦИИ — таблица дропа.
-            //    Если дроп известен и нашего предмета в нём нет — объект
-            //    не подходит ТОЧНО (даже если имя похоже).
             string[] drops = GetDropNames(prefab, destr);
             if (drops != null)
             {
@@ -141,30 +145,24 @@ namespace TrollTamerMod
                         return true;
                 return false;
             }
-
-            // 2) Фоллбэк по точному имени префаба (если дроп не читается)
             return FallbackNameMatch(prefab, type);
         }
 
-        // ---------- чтение таблицы дропа (рефлексия + кэш) ----------
-
+        // ВСЕ таблицы дропа со ВСЕЙ иерархии, БЕЗ break.
+        // У rock4_copper DropOnDestroyed основания дропает камень, а руда —
+        // в таблице самого MineRock5. Первый найденный раньше давал break.
         private static string[] GetDropNames(string prefab, MonoBehaviour sample)
         {
             if (s_dropCache.ContainsKey(prefab)) return s_dropCache[prefab];
 
             HashSet<string> names = new HashSet<string>();
+            HashSet<object> visited = new HashSet<object>();
             try
             {
-                // деревья/деструктиблы: DropOnDestroyed компонент
                 foreach (DropOnDestroyed dod in sample.GetComponentsInChildren<DropOnDestroyed>(true))
-                {
-                    CollectFromValue(dod, names, 0);
-                    if (names.Count > 0) break;
-                }
+                    CollectFromValue(dod, names, visited, 0);
 
-                // MineRock5 / MineRock: DropTable в полях компонента
-                if (names.Count == 0)
-                    CollectFromValue(sample, names, 0);
+                CollectFromValue(sample, names, visited, 0);
             }
             catch (Exception e)
             {
@@ -178,11 +176,10 @@ namespace TrollTamerMod
             return result;
         }
 
-        // Рекурсивно ищем ссылки на ItemDrop в полях/списках объекта
-        // (DropOnDestroyed.m_dropList -> DropData.m_item, MineRock5.m_dropList и т.д.)
-        private static void CollectFromValue(object val, HashSet<string> names, int depth)
+        // Рекурсивный обход полей: СТРУКТУРЫ ТОЖЕ (DropTable.DropData — структура!)
+        private static void CollectFromValue(object val, HashSet<string> names, HashSet<object> visited, int depth)
         {
-            if (val == null || depth > 4 || names.Count > 24) return;
+            if (val == null || depth > 5 || names.Count > 32) return;
 
             if (val is ItemDrop itemDrop)
             {
@@ -199,55 +196,48 @@ namespace TrollTamerMod
                 return;
             }
 
+            if (val is UnityEngine.Object) return;
+
             Type t = val.GetType();
-            if (t.IsValueType || t == typeof(string) || t.IsEnum) return;
-            if (val is Transform || val is Material || val is Texture || val is Mesh ||
-                val is Shader || val is AudioClip || val is Animator ||
-                val is Animation || val is AnimationClip || val is Rigidbody) return;
+            if (t.IsPrimitive || t == typeof(string) || t.IsEnum) return;
+
+            if (!t.IsValueType && !visited.Add(val)) return;
 
             if (val is System.Collections.IEnumerable en)
             {
                 foreach (object o in en)
-                {
-                    if (o == null || o is ValueType || o is string) continue;
-                    if (names.Count > 24) break;
-                    CollectFromValue(o, names, depth + 1);
-                }
+                    CollectFromValue(o, names, visited, depth + 1);
                 return;
             }
 
             foreach (FieldInfo f in t.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
             {
-                if (names.Count > 24) break;
-                try
-                {
-                    object fv = f.GetValue(val);
-                    if (fv == null) continue;
-                    if (fv is Transform || fv is Material || fv is Texture || fv is Mesh ||
-                        fv is Shader || fv is AudioClip || fv is Animator) continue;
-                    CollectFromValue(fv, names, depth + 1);
-                }
+                if (names.Count > 32) break;
+                try { CollectFromValue(f.GetValue(val), names, visited, depth + 1); }
                 catch { }
             }
         }
 
-        // ---------- фоллбэк по точным именам (только если дроп не читается) ----------
+        // фоллбэк по точным именам (если дроп не читается)
 
         private static readonly HashSet<string> FallbackWood = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { "Beech1", "Beech_small1", "Beech_small2", "Beech_Stub", "beech_log", "beech_log_half",
-          "BirchStub", "OakStub", "AshlandsTreeStump1", "AshlandsTreeStump2", "AshlandsTreeStump3" };
+          "BirchStub", "OakStub", "Pinetree_01", "Pinetree_01_Stub", "PineTree_log", "PineTree_log_half",
+          "FirTree", "FirTree_small", "FirTree_small_dead", "FirTree_Stub", "FirTree_log", "FirTree_log_half",
+          "AshlandsTreeStump1", "AshlandsTreeStump2", "AshlandsTreeStump3" };
 
         private static readonly HashSet<string> FallbackFine = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { "Birch1", "Birch1_aut", "Birch2", "Birch2_aut", "Birch_log", "Birch_log_half", "Oak1" };
 
         private static readonly HashSet<string> FallbackCore = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { "Pinetree_01", "Pinetree_01_Stub", "PineTree_log", "PineTree_log_half",
-          "FirTree", "FirTree_Stub", "FirTree_log", "FirTree_log_half" };
+          "FirTree", "FirTree_Stub", "FirTree_log", "FirTree_log_half",
+          "FirTree_big", "FirTree_Big_log", "FirTree_big_log_half", "FirTree_Big_plantable_Stub" };
 
         private static readonly HashSet<string> FallbackStone = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { "rock1_mountain", "rock2_heath", "rock2_mountain", "rock3_mountain",
           "rock4_coast", "rock4_forest", "rock4_heath", "MineRock_Stone",
-          "Rock_3", "Rock_4", "Rock_7", "BigRock", "rock_mistlands1" };
+          "Rock_3", "Rock_4", "Rock_4_plains", "Rock_7", "BigRock", "rock_mistlands1" };
 
         private static readonly HashSet<string> FallbackCopper = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { "rock4_copper", "MineRock_Copper" };
@@ -279,33 +269,37 @@ namespace TrollTamerMod
         public static readonly int HashGatherKey = ZDO_GATHER_KEY.GetStableHashCode();
 
         private MonoBehaviour m_target;
-        private float m_searchTimer;
-        private float m_attackTimer;
+        private Collider[] m_targetCols;
+        private Vector3 m_surfacePoint;
 
-        // контроль прогресса (лечит «вечную ходьбу» к недостижимой цели)
+        private float m_searchCooldown;
+        private float m_attackTimer;
+        private int m_searchFailCount;
+
+        // контроль прогресса (только фаза подхода)
         private float m_progressCheckTimer;
-        private float m_lastTargetDist = float.MaxValue;
+        private float m_lastSurfaceDist = float.MaxValue;
         private int m_noProgressCount;
         private int m_abandonCount;
-        private Vector3 m_lastStuckPos;
-        private int m_searchFailCount;
         private float m_lastMsgTime = -30f;
 
-        private const float SearchInterval = 2f;
+        private const float SearchCooldown = 3f;
         private const float SearchRadius = 80f;
-        private const float AttackRange = 5.5f;
-        private const float AttackInterval = 1.3f;
+        private const float AttackRange = 4.5f;       // до ПОВЕРХНОСТИ цели
+        private const float AttackInterval = 1.5f;
         private const float AttackDamage = 250f;
         private const int AttackToolTier = 4;
-        private const int MaxSearchFails = 3;        // подряд без кандидатов -> стоп
-        private const int MaxAbandons = 3;          // подряд брошенных целей -> стоп
-        private const float ProgressWindow = 5f;     // окно контроля прогресса, сек
-        private const float ProgressMinGain = 2f;   // мин. приближение за окно, м
+        private const int MaxSearchFails = 3;
+        private const int MaxAbandons = 3;
+        private const float ProgressWindow = 6f;
+        private const float ProgressMinGain = 1.5f;
 
-        private static readonly int s_searchMask =
-            LayerMask.GetMask("Default", "static_solid", "Default_small");
+        // всё кроме террейна/воды/персонажей; триггеры сканируем (зоны MineRock5)
+        private static readonly int s_searchMask = ~LayerMask.GetMask(
+            "terrain", "Water", "character", "character_net", "character_ghost", "hitbox", "vehicle");
         private static readonly Collider[] s_overlap = new Collider[512];
         private static readonly MethodInfo s_moveTo = AccessTools.Method(typeof(BaseAI), "MoveTo");
+        private static readonly MethodInfo s_lookAt = AccessTools.Method(typeof(BaseAI), "LookAt");
 
         private void Awake()
         {
@@ -329,51 +323,112 @@ namespace TrollTamerMod
             int type = m_nview.GetZDO().GetInt(HashGatherKey, 0);
             if (type <= 0) { StopGather(); return; }
 
-            m_searchTimer += dt;
-            if (m_searchTimer >= SearchInterval || (m_target == null && m_searchTimer >= 1f))
+            // --- цель жива? ---
+            bool targetAlive = m_target != null && m_target.gameObject.activeInHierarchy;
+            if (!targetAlive)
             {
-                m_searchTimer = 0;
+                m_target = null;
+                m_targetCols = null;
+
+                if (m_searchCooldown > 0)
+                {
+                    m_searchCooldown -= dt;
+                    m_ai?.StopMoving();
+                    return;
+                }
+                m_searchCooldown = SearchCooldown;
                 FindTarget((GatherType)type);
+                return;
             }
 
-            MonoBehaviour mb = m_target;
-            if (mb == null || !mb.gameObject.activeInHierarchy) { m_target = null; return; }
-
-            Vector3 targetPos = mb.transform.position;
-            float dist = Utils.DistanceXZ(targetPos, transform.position);
+            // --- точка поверхности цели ---
+            m_surfacePoint = ClosestSurfacePoint(transform.position);
+            float dist = Utils.DistanceXZ(m_surfacePoint, transform.position);
 
             if (dist > AttackRange)
             {
+                // ФАЗА ПОДХОДА
                 if (m_ai != null)
                 {
-                    Vector3 dir = targetPos - transform.position;
-                    dir.y = 0;
-                    if (dir.sqrMagnitude > 0.01f)
+                    bool run = dist > 15f;
+                    try { s_moveTo?.Invoke(m_ai, new object[] { dt, m_surfacePoint, 1.5f, run }); }
+                    catch
                     {
-                        dir.Normalize();
-                        bool run = dist > 15f;
-                        try { s_moveTo?.Invoke(m_ai, new object[] { dt, targetPos, AttackRange * 0.8f, run }); }
-                        catch { m_ai.MoveTowards(dir, run); }
+                        Vector3 dir = m_surfacePoint - transform.position;
+                        dir.y = 0;
+                        if (dir.sqrMagnitude > 0.01f) m_ai.MoveTowards(dir.normalized, run);
                     }
                 }
-                TrackProgress(dist, dt);
+                TrackProgress(dist, dt); // прогресс — ТОЛЬКО в подходе
             }
             else
             {
+                // ФАЗА УДАРА: стоим, поворачиваемся, бьём
                 m_ai?.StopMoving();
+
+                try { s_lookAt?.Invoke(m_ai, new object[] { m_surfacePoint }); }
+                catch { }
+
                 m_attackTimer += dt;
                 if (m_attackTimer >= AttackInterval)
                 {
                     m_attackTimer = 0;
-                    PerformAttack(mb);
+                    PerformSwing();
                 }
             }
         }
 
+        // Урон НЕ зависит от StartAttack (безоружному троллю он вернёт false)
+        private void PerformSwing()
+        {
+            try { if (!m_character.InAttack()) m_character.StartAttack(null, false); }
+            catch { }
+            ApplyDamage();
+        }
+
+        // ============================================================
+        //  УРОН — СТАНДАРТНЫЙ ПУТЬ ИГРЫ (IDestructible.Damage)
+        // ============================================================
+        private void ApplyDamage()
+        {
+            MonoBehaviour mb = m_target;
+            if (mb == null || !mb.gameObject.activeInHierarchy) return;
+            if (!(mb is IDestructible destr)) return;
+
+            try
+            {
+                // вектор от тролля к точке поверхности — направление удара
+                Vector3 hitDir = m_surfacePoint - transform.position;
+                hitDir.y = 0f;
+                if (hitDir.sqrMagnitude < 0.01f) hitDir = transform.forward;
+                else hitDir.Normalize();
+
+                // точка удара: поверхность + лёгкое «продавливание» внутрь,
+                // чтобы гарантированно попасть в зону MineRock5 (как кирка)
+                Vector3 hitPoint = m_surfacePoint + hitDir * 0.3f + Vector3.up * 0.2f;
+
+                HitData hit = new HitData();
+                hit.m_damage.m_damage = AttackDamage;   // общий (деревья)
+                hit.m_damage.m_pickaxe = AttackDamage;   // урон КИРКИ (камни/руды)
+                hit.m_toolTier = AttackToolTier;
+                hit.m_point = hitPoint;
+                hit.m_dir = hitDir;
+                hit.m_hitType = HitData.HitType.EnemyHit;
+                destr.Damage(hit);
+
+                Debug.Log("[TrollMenu] Damage -> " + TrollResourceMatcher.GetRootPrefabName(mb));
+            }
+            catch (Exception e) { Debug.LogWarning("[TrollMenu] Attack failed: " + e.Message); }
+        }
+
+        // ============================================================
+        //  ПОИСК ЦЕЛИ (только при её отсутствии)
+        // ============================================================
         private void FindTarget(GatherType type)
         {
             Vector3 center = transform.position + Vector3.up * 2f;
             int n = Physics.OverlapSphereNonAlloc(center, SearchRadius, s_overlap, s_searchMask);
+
             MonoBehaviour best = null;
             float bestDist = float.MaxValue;
             HashSet<UnityEngine.Object> seen = new HashSet<UnityEngine.Object>();
@@ -381,12 +436,12 @@ namespace TrollTamerMod
             for (int i = 0; i < n; i++)
             {
                 Collider c = s_overlap[i];
-                if (c == null || c.isTrigger) continue;
+                if (c == null) continue;
 
                 MonoBehaviour destr = TrollResourceMatcher.FindDestructible(c);
                 if (destr == null) continue;
-                if (!seen.Add(destr)) continue;                     // дедуп по объекту
-                if (destr.transform.IsChildOf(transform)) continue;  // своё
+                if (!seen.Add(destr)) continue;
+                if (destr.transform.IsChildOf(transform)) continue;
                 if (!TrollResourceMatcher.TargetMatches(destr, type)) continue;
 
                 float dist = Utils.DistanceXZ(destr.transform.position, transform.position);
@@ -395,17 +450,17 @@ namespace TrollTamerMod
 
             if (best != null)
             {
-                if (m_target != best)
-                {
-                    m_target = best;
-                    m_lastTargetDist = float.MaxValue;
-                    m_progressCheckTimer = 0;
-                    m_noProgressCount = 0;
-                    m_lastStuckPos = transform.position;
-                }
+                m_target = best;
+                m_targetCols = best.GetComponentsInChildren<Collider>(true);
+                m_lastSurfaceDist = float.MaxValue;
+                m_progressCheckTimer = 0;
+                m_noProgressCount = 0;
                 m_searchFailCount = 0;
+                m_abandonCount = 0;
+                Debug.Log("[TrollMenu] Target: " + TrollResourceMatcher.GetRootPrefabName(best) +
+                          " dist=" + bestDist.ToString("F0"));
             }
-            else if (m_target == null)
+            else
             {
                 m_searchFailCount++;
                 if (m_searchFailCount >= MaxSearchFails)
@@ -416,15 +471,45 @@ namespace TrollTamerMod
             }
         }
 
-        // Если за ProgressWindow секунд не приблизились к цели хотя бы на
-        // ProgressMinGain метров — цель считается недостижимой и отбрасывается.
+        // ============================================================
+        //  ТОЧКА ПОВЕРХНОСТИ ЦЕЛИ
+        // ============================================================
+        private Vector3 ClosestSurfacePoint(Vector3 from)
+        {
+            if (m_target == null) return transform.position;
+            if (m_targetCols == null || m_targetCols.Length == 0)
+                m_targetCols = m_target.GetComponentsInChildren<Collider>(true);
+
+            Vector3 best = m_target.transform.position;
+            float bestSqr = float.MaxValue;
+
+            foreach (Collider c in m_targetCols)
+            {
+                if (c == null || !c.enabled) continue;
+                Vector3 p;
+                try
+                {
+                    MeshCollider mc = c as MeshCollider;
+                    p = (mc != null && !mc.convex) ? c.bounds.ClosestPoint(from) : c.ClosestPoint(from);
+                }
+                catch { p = c.bounds.ClosestPoint(from); }
+
+                float d2 = (p - from).sqrMagnitude;
+                if (d2 < bestSqr) { bestSqr = d2; best = p; }
+            }
+            return best;
+        }
+
+        // ============================================================
+        //  ПРОГРЕСС (только в фазе ПОДХОДА)
+        // ============================================================
         private void TrackProgress(float dist, float dt)
         {
             m_progressCheckTimer += dt;
             if (m_progressCheckTimer < ProgressWindow) return;
 
             m_progressCheckTimer = 0;
-            float gain = m_lastTargetDist - dist;
+            float gain = m_lastSurfaceDist - dist;
 
             if (gain < ProgressMinGain)
             {
@@ -434,7 +519,8 @@ namespace TrollTamerMod
                     m_noProgressCount = 0;
                     m_abandonCount++;
                     m_target = null;
-                    m_lastTargetDist = float.MaxValue;
+                    m_targetCols = null;
+                    m_searchCooldown = 0;
 
                     if (m_abandonCount >= MaxAbandons)
                     {
@@ -444,34 +530,9 @@ namespace TrollTamerMod
                     }
                 }
             }
-            else
-            {
-                m_noProgressCount = 0;
-                m_abandonCount = 0;
-            }
+            else { m_noProgressCount = 0; m_abandonCount = 0; }
 
-            m_lastTargetDist = dist;
-        }
-
-        private void PerformAttack(MonoBehaviour target)
-        {
-            if (m_character == null) return;
-
-            try { if (!m_character.InAttack()) m_character.StartAttack(null, false); }
-            catch { }
-
-            if (!(target is IDestructible destr)) return;
-            try
-            {
-                HitData hit = new HitData();
-                hit.m_damage.m_damage = AttackDamage;
-                hit.m_toolTier = AttackToolTier;
-                hit.m_point = target.transform.position + Vector3.up;
-                hit.m_dir = Vector3.up;
-                hit.m_hitType = HitData.HitType.EnemyHit;
-                destr.Damage(hit);
-            }
-            catch (Exception e) { Debug.LogWarning("[TrollMenu] Attack failed: " + e.Message); }
+            m_lastSurfaceDist = dist;
         }
 
         private void StopGather()
@@ -492,16 +553,19 @@ namespace TrollTamerMod
             Player.m_localPlayer?.Message(MessageHud.MessageType.TopLeft, msg, 0, null, false);
         }
 
+        // ============================================================
+        //  ПУБЛИЧНОЕ API
+        // ============================================================
         public static void Start(ZNetView trollNview, GatherType type)
         {
             if (trollNview == null || !trollNview.IsValid()) return;
-
             if (!trollNview.IsOwner()) trollNview.ClaimOwnership();
             ZDO zdo = trollNview.GetZDO();
             if (zdo == null) return;
 
-            // отменяем маршрут (рулевая система платформы работает и без него)
+            // отмена маршрута
             zdo.Set(TrollBuildingMod.TrollWalkConstants.HashActive, false);
+            TrollBuildingMod.TrollWalkManager.Instance?.CancelRoute(zdo.m_uid, false);
 
             int current = zdo.GetInt(HashGatherKey, 0);
             if (current == (int)type)
@@ -513,30 +577,73 @@ namespace TrollTamerMod
 
             zdo.Set(HashGatherKey, (int)type);
 
+            // сброс следования (иначе ваниль тянула тролля к игроку)
+            MonsterAI ai = trollNview.GetComponent<MonsterAI>();
+            if (ai != null)
+            {
+                try
+                {
+                    ai.SetFollowTarget(null);
+                    ai.ResetPatrolPoint();
+                    zdo.Set(ZDOVars.s_follow, "");
+                }
+                catch { }
+            }
+
             TrollGatherController ctrl = trollNview.GetComponent<TrollGatherController>();
             if (ctrl == null) ctrl = trollNview.gameObject.AddComponent<TrollGatherController>();
             ctrl.m_target = null;
-            ctrl.m_searchTimer = SearchInterval;
+            ctrl.m_targetCols = null;
+            ctrl.m_searchCooldown = 0;
             ctrl.m_searchFailCount = 0;
             ctrl.m_abandonCount = 0;
-            ctrl.m_lastTargetDist = float.MaxValue;
+            ctrl.m_lastSurfaceDist = float.MaxValue;
 
             string[] names = { "", "древесину", "качественную древесину", "цельную древесину", "камень", "медь" };
             Player.m_localPlayer?.Message(MessageHud.MessageType.Center,
                 $"Тролль добывает: {names[(int)type]}", 0, null, false);
         }
+
+        public static void CancelWork(Character troll)
+        {
+            if (troll == null) return;
+            try
+            {
+                ZNetView nv = troll.GetComponent<ZNetView>();
+                if (nv == null || !nv.IsValid() || nv.GetZDO() == null) return;
+                ZDO zdo = nv.GetZDO();
+
+                bool hadWork = zdo.GetInt(HashGatherKey, 0) > 0 ||
+                               zdo.GetBool(TrollBuildingMod.TrollWalkConstants.HashActive, false);
+                if (!hadWork) return;
+
+                if (!nv.IsOwner()) nv.ClaimOwnership();
+                zdo.Set(HashGatherKey, 0);
+                zdo.Set(TrollBuildingMod.TrollWalkConstants.HashActive, false);
+                zdo.Set(TrollBuildingMod.TrollWalkConstants.HashArrivedFlag, false);
+
+                TrollBuildingMod.TrollWalkManager.Instance?.CancelRoute(zdo.m_uid, false);
+
+                TrollGatherController ctrl = troll.GetComponent<TrollGatherController>();
+                if (ctrl != null) UnityEngine.Object.Destroy(ctrl);
+
+                if (Player.m_localPlayer != null)
+                    Player.m_localPlayer.Message(MessageHud.MessageType.TopLeft,
+                        "Тролль отозван с задания", 0, null, false);
+            }
+            catch (Exception e) { Debug.LogWarning("[TrollMenu] CancelWork: " + e.Message); }
+        }
     }
 
     // ================================================================
-    //  РАДИАЛЬНОЕ МЕНЮ v5 (x2 размер, улучшенное качество)
+    //  РАДИАЛЬНОЕ МЕНЮ
     // ================================================================
     public class TrollRadialMenu : MonoBehaviour
     {
         public static TrollRadialMenu Instance { get; private set; }
         public static bool IsOpen => Instance != null && Instance.m_active;
 
-        // ---- геометрия (x2 от v4) ----
-        private const float ItemRadius = 265f;      // радиус расположения кнопок
+        private const float ItemRadius = 265f;
         private const float MainButtonSize = 108f;
         private const float SubButtonSize = 84f;
         private const float LabelOffset = 76f;
@@ -551,7 +658,7 @@ namespace TrollTamerMod
             public string Description;
             public Sprite Icon;
             public Action OnSelect;
-            public float Angle;      // 0=право, 90=верх
+            public float Angle;
             public bool IsSubItem;
             public string GroupId;
             public bool Visible;
@@ -660,27 +767,21 @@ namespace TrollTamerMod
             rootRect.offsetMin = Vector2.zero;
             rootRect.offsetMax = Vector2.zero;
 
-            // виньетка (прозрачный центр -> тёмные края)
             Image vig = MakeImage(root.transform, "Vignette", VignetteSprite, Color.white);
             StretchFull(vig.rectTransform);
 
-            // центральный диск-подложка
             Image disc = MakeImage(root.transform, "Disc", CircleSprite, new Color(0.02f, 0.02f, 0.02f, 0.92f));
             Place(disc.rectTransform, Vector2.zero, new Vector2(460, 460));
 
-            // лёгкая кромка диска
             Image discEdge = MakeImage(root.transform, "DiscEdge", RingSprite, new Color(1f, 1f, 1f, 0.12f));
             Place(discEdge.rectTransform, Vector2.zero, new Vector2(466, 466));
 
-            // основное кольцо
             Image ring = MakeImage(root.transform, "Ring", RingSprite, new Color(1f, 1f, 1f, 0.16f));
             Place(ring.rectTransform, Vector2.zero, new Vector2(780, 780));
 
-            // декоративное тонкое кольцо
             Image ring2 = MakeImage(root.transform, "Ring2", RingSprite, new Color(1f, 0.83f, 0.35f, 0.10f));
             Place(ring2.rectTransform, Vector2.zero, new Vector2(660, 660));
 
-            // тексты в центре
             m_titleText = MakeText(root.transform, "Title", 27, Color.white);
             Place(m_titleText.rectTransform, new Vector2(0, 40), new Vector2(400, 38));
 
@@ -741,7 +842,6 @@ namespace TrollTamerMod
         // ============================================================
         private void BuildItems()
         {
-            // главные: верх — заморозка, лево — лес, право — камень, низ — маршрут
             AddItem("Freeze", 90f, false, null,
                 "Не двигаться", "Режим неподвижности: вкл/выкл",
                 LoadEmbeddedIcon("freeze.png"), OnFreeze);
@@ -758,18 +858,16 @@ namespace TrollTamerMod
                 "Маршрут", "Отправить тролля по карте",
                 LoadEmbeddedIcon("map.png"), OnMap);
 
-            // подпункты леса
             AddItem("CoreWood", 150f, true, "forest",
                 "Цельная древесина", "Сосна, пихта",
                 LoadEmbeddedIcon("CoreWood.png"), () => OnGather(GatherType.CoreWood));
             AddItem("FineWood", 180f, true, "forest",
-                "Качественная древесина", "Берёза, дуб",
+                "Качественная древесина", "Берёза, дуб, брёвна берёзы",
                 LoadEmbeddedIcon("fineWood.png"), () => OnGather(GatherType.FineWood));
             AddItem("Wood", 210f, true, "forest",
                 "Древесина", "Бук, пни, брёвна",
                 LoadEmbeddedIcon("Wood.png"), () => OnGather(GatherType.Wood));
 
-            // подпункты камня
             AddItem("StoneRes", 20f, true, "stone",
                 "Камень", "Валуны и каменные глыбы",
                 LoadEmbeddedIcon("stone.png", "stone"), () => OnGather(GatherType.Stone));
@@ -803,24 +901,19 @@ namespace TrollTamerMod
             root.transform.SetParent(m_canvas.transform, false);
             Place(root.GetComponent<RectTransform>(), dir * ItemRadius, Vector2.zero);
 
-            // мягкое свечение позади кнопки
             Image glow = MakeImage(root.transform, "Glow", GlowSprite, GlowIdle);
             Place(glow.rectTransform, Vector2.zero, new Vector2(btnSize * 1.6f, btnSize * 1.6f));
 
-            // тёмная круглая подложка
             Image fill = MakeImage(root.transform, "Fill", CircleSprite, FillColor);
             Place(fill.rectTransform, Vector2.zero, new Vector2(btnSize, btnSize));
 
-            // ободок
             Image border = MakeImage(root.transform, "Border", RingSprite, BorderIdle);
             Place(border.rectTransform, Vector2.zero, new Vector2(btnSize, btnSize));
 
-            // иконка
             Image iconImg = MakeImage(root.transform, "Icon", icon, Color.white);
             iconImg.preserveAspect = true;
             Place(iconImg.rectTransform, Vector2.zero, new Vector2(btnSize * 0.62f, btnSize * 0.62f));
 
-            // подпись под кнопкой
             Text label = MakeText(root.transform, "Label", isSub ? 13 : 17, LabelIdle);
             label.text = name;
             Place(label.rectTransform, new Vector2(0, -LabelOffset), new Vector2(210, 30));
@@ -930,7 +1023,6 @@ namespace TrollTamerMod
             foreach (MenuItem item in m_allItems)
             {
                 if (item.GroupId == null) continue;
-
                 bool grpExpanded = item.GroupId == "forest" ? m_forestExpanded : m_stoneExpanded;
                 item.Visible = item.IsSubItem ? grpExpanded : !grpExpanded;
             }
@@ -951,7 +1043,6 @@ namespace TrollTamerMod
         {
             MenuItem sel = m_selected;
 
-            // клик по главной кнопке группы — мгновенное раскрытие
             if (sel.GroupId != null && !sel.IsSubItem)
             {
                 if (sel.GroupId == "forest") { m_forestHover = ExpandDelay + 0.01f; m_forestCollapse = 0; }
@@ -1029,27 +1120,24 @@ namespace TrollTamerMod
         }
 
         // ============================================================
-        //  ПРОЦЕДУРНЫЕ СПРАЙТЫ (256px, антиалиасинг)
+        //  ПРОЦЕДУРНЫЕ СПРАЙТЫ
         // ============================================================
         private static Sprite CircleSprite
         {
             get
             {
                 if (s_circle != null) return s_circle;
-                int size = 256;
-                float c = (size - 1) * 0.5f;
+                int size = 256; float c = (size - 1) * 0.5f;
                 Texture2D tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
                 Color32[] px = new Color32[size * size];
                 for (int y = 0; y < size; y++)
                     for (int x = 0; x < size; x++)
                     {
                         float d = Vector2.Distance(new Vector2(x, y), new Vector2(c, c)) - c;
-                        float a = Mathf.Clamp01(1.5f - d); // ~1.5px AA
+                        float a = Mathf.Clamp01(1.5f - d);
                         px[y * size + x] = new Color32(255, 255, 255, (byte)(a * 255));
                     }
-                tex.SetPixels32(px);
-                tex.Apply();
-                tex.wrapMode = TextureWrapMode.Clamp;
+                tex.SetPixels32(px); tex.Apply(); tex.wrapMode = TextureWrapMode.Clamp;
                 s_circle = Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), size);
                 return s_circle;
             }
@@ -1060,9 +1148,7 @@ namespace TrollTamerMod
             get
             {
                 if (s_ring != null) return s_ring;
-                int size = 256;
-                float c = (size - 1) * 0.5f;
-                float thick = 10f; // толщина в px спрайта
+                int size = 256; float c = (size - 1) * 0.5f; float thick = 10f;
                 Texture2D tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
                 Color32[] px = new Color32[size * size];
                 for (int y = 0; y < size; y++)
@@ -1073,9 +1159,7 @@ namespace TrollTamerMod
                                   Mathf.Clamp01(1.5f - Mathf.Abs(d - thick * 0.5f));
                         px[y * size + x] = new Color32(255, 255, 255, (byte)(Mathf.Clamp01(a) * 255));
                     }
-                tex.SetPixels32(px);
-                tex.Apply();
-                tex.wrapMode = TextureWrapMode.Clamp;
+                tex.SetPixels32(px); tex.Apply(); tex.wrapMode = TextureWrapMode.Clamp;
                 s_ring = Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), size);
                 return s_ring;
             }
@@ -1086,21 +1170,17 @@ namespace TrollTamerMod
             get
             {
                 if (s_glow != null) return s_glow;
-                int size = 128;
-                float c = (size - 1) * 0.5f;
+                int size = 128; float c = (size - 1) * 0.5f;
                 Texture2D tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
                 Color32[] px = new Color32[size * size];
                 for (int y = 0; y < size; y++)
                     for (int x = 0; x < size; x++)
                     {
                         float r = Vector2.Distance(new Vector2(x, y), new Vector2(c, c)) / c;
-                        float a = Mathf.Clamp01(1f - r);
-                        a = a * a * a; // мягкий радиальный градиент
+                        float a = Mathf.Clamp01(1f - r); a = a * a * a;
                         px[y * size + x] = new Color32(255, 255, 255, (byte)(a * 255));
                     }
-                tex.SetPixels32(px);
-                tex.Apply();
-                tex.wrapMode = TextureWrapMode.Clamp;
+                tex.SetPixels32(px); tex.Apply(); tex.wrapMode = TextureWrapMode.Clamp;
                 s_glow = Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), size);
                 return s_glow;
             }
@@ -1111,20 +1191,17 @@ namespace TrollTamerMod
             get
             {
                 if (s_vignette != null) return s_vignette;
-                int size = 128;
-                float c = (size - 1) * 0.5f;
+                int size = 128; float c = (size - 1) * 0.5f;
                 Texture2D tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
                 Color32[] px = new Color32[size * size];
                 for (int y = 0; y < size; y++)
                     for (int x = 0; x < size; x++)
                     {
                         float r = Vector2.Distance(new Vector2(x, y), new Vector2(c, c)) / c;
-                        float a = Mathf.SmoothStep(0.25f, 1f, r) * 0.5f; // центр чист, края тёмные
+                        float a = Mathf.SmoothStep(0.25f, 1f, r) * 0.5f;
                         px[y * size + x] = new Color32(0, 0, 0, (byte)(a * 255));
                     }
-                tex.SetPixels32(px);
-                tex.Apply();
-                tex.wrapMode = TextureWrapMode.Clamp;
+                tex.SetPixels32(px); tex.Apply(); tex.wrapMode = TextureWrapMode.Clamp;
                 s_vignette = Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), size);
                 return s_vignette;
             }
@@ -1141,14 +1218,12 @@ namespace TrollTamerMod
                     float d = Mathf.Abs(x - size / 2f + 0.5f) + Mathf.Abs(y - size / 2f + 0.5f);
                     px[y * size + x] = d < size * 0.36f ? color : new Color32(0, 0, 0, 0);
                 }
-            tex.SetPixels32(px);
-            tex.Apply();
-            tex.wrapMode = TextureWrapMode.Clamp;
+            tex.SetPixels32(px); tex.Apply(); tex.wrapMode = TextureWrapMode.Clamp;
             return Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), size);
         }
 
         // ============================================================
-        //  ЗАГРУЗКА ИКОНОК — EMBEDDED RESOURCE (по суффиксу имени)
+        //  ИКОНКИ — EMBEDDED RESOURCE (по суффиксу имени)
         // ============================================================
         private static Sprite LoadEmbeddedIcon(params string[] fileNames)
         {
@@ -1234,9 +1309,7 @@ namespace TrollTamerMod
         private static bool RouteBegin_Prefix(ZDOID troll)
         {
             if (TrollMenuState.RouteBypass) return true;
-
             if (TrollRadialMenu.IsOpen) { TrollRadialMenu.Close(); return false; }
-
             TrollRadialMenu.Show(troll);
             return false;
         }
@@ -1251,22 +1324,16 @@ namespace TrollTamerMod
             return true;
         }
 
-        // Курсор свободен, пока меню открыто (та же ветка, что ваниль
-        // выполняет для Hud.InRadial() с активной мышью)
+        // Курсор свободен, пока меню открыто
         [HarmonyPatch(typeof(GameCamera), "UpdateMouseCapture")]
         [HarmonyPrefix]
         [HarmonyPriority(Priority.VeryHigh)]
         private static bool GameCamera_UpdateMouseCapture_Prefix(GameCamera __instance)
         {
             if (!TrollMenuState.IsOpen) return true;
-
-            try
-            {
-                ZCursor.LockState = CursorLockMode.None;
-                ZCursor.Show();
-            }
+            try { ZCursor.LockState = CursorLockMode.None; ZCursor.Show(); }
             catch { }
-            return false; // не даём игре залочить курсор
+            return false;
         }
 
         // Обзор заморожен (мышь)
@@ -1293,6 +1360,36 @@ namespace TrollTamerMod
         private static bool GameCamera_UpdateCamera_Prefix()
         {
             return !TrollMenuState.IsOpen;
+        }
+
+        // Следование за игроком отключено во время добычи
+        [HarmonyPatch(typeof(BaseAI), "Follow")]
+        [HarmonyPrefix]
+        private static bool BaseAI_Follow_Prefix(BaseAI __instance)
+        {
+            if (__instance == null) return true;
+            Character c = __instance.GetComponent<Character>();
+            if (c == null || !c.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase)) return true;
+
+            ZNetView nv = __instance.GetComponent<ZNetView>();
+            if (nv == null || !nv.IsValid() || nv.GetZDO() == null) return true;
+
+            if (nv.GetZDO().GetInt(TrollGatherController.HashGatherKey, 0) > 0) return false;
+            return true;
+        }
+
+        // Ванильная команда (следовать/стоять) отменяет работу
+        [HarmonyPatch(typeof(Tameable), "RPC_Command")]
+        [HarmonyPostfix]
+        private static void Tameable_RPC_Command_Postfix(Tameable __instance)
+        {
+            try
+            {
+                Character c = __instance != null ? __instance.GetComponent<Character>() : null;
+                if (c == null || !c.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase)) return;
+                TrollGatherController.CancelWork(c);
+            }
+            catch (Exception e) { Debug.LogWarning("[TrollMenu] Command cancel: " + e.Message); }
         }
 
         // Idle-движение отключено во время добычи

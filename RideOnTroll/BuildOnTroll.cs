@@ -2006,6 +2006,13 @@ namespace TrollBuildingMod
                 if (!__instance.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase)) return;
                 TrollPiecesContainer container = __instance.GetComponent<TrollPiecesContainer>();
                 if (container == null || container.PieceCount == 0) return; // без платформы — ваниль
+                                                                            // FIX 21 (Menu): во время ДОБЫЧИ руление платформы отключено —
+                                                                            // цель добычи сама является препятствием для BoxCast, и тролль
+                                                                            // бесконечно кружил вокруг неё. К цели идём напрямую (ваниль).
+                ZNetView gnv = __instance.GetComponent<ZNetView>();
+                if (gnv != null && gnv.IsValid() && gnv.GetZDO() != null &&
+                    gnv.GetZDO().GetInt(TrollTamerMod.TrollGatherController.HashGatherKey, 0) > 0)
+                    return;
 
                 container.Navigator.HandleMoveTowards(__instance, ref dir);
             }
