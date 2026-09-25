@@ -1377,7 +1377,7 @@ namespace TrollBuildingMod
                 string rn = zdo.GetString(TrollWalkConstants.HashName, "");
                 __result += $"\n<color=#aaccff>{TrollWalkLoc.T("On the way:", "В пути:")} {rn}</color>";
             }
-            __result += $"\n[<color=yellow><b>Y</b></color>] {TrollWalkLoc.T("Send to waypoint (map)", "Отправить (карта)")}";
+            __result += $"\n[<color=yellow><b>Y</b></color>] {TrollWalkLoc.T("Action menu", "Меню")}";
         }
 
         [HarmonyPatch(typeof(Tameable), "GetHoverName")]
@@ -1405,6 +1405,7 @@ namespace TrollBuildingMod
             if (Chat.instance != null && Chat.instance.HasFocus()) return;
             if (global::Console.IsVisible() || Menu.IsActive() || InventoryGui.IsVisible() || Hud.InRadial()) return;
             if (TrollWalkRouteSession.Active) return;
+            if (TrollTamerMod.TrollMenuState.RouteBypass) return; // Обход для меню
 
             GameObject hover = __instance.GetHoverObject();
             if (hover == null) return;
