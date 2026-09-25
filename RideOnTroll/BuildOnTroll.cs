@@ -9,25 +9,30 @@ using UnityEngine.Rendering;
 
 // ============================================================================
 //  ИСТОРИЯ ФИКСОВ:
-//  FIX 1..6: сохранность построек.
-//  FIX 9..16: итерации платформенной навигации (сетка/A*/ломание).
-//  FIX 13: восстановление потерянной платформы.
-//  FIX 17 (текущее, ГИБРИДНАЯ АРХИТЕКТУРА):
-//   17a. РЕЖИМЫ: навигатор и ломание работают ТОЛЬКО в режиме маршрута
-//        (TrollWalk, ZDO-флаг HashActive) и только при наличии построек.
-//        Следование/охрана/idle/дикие тролли/без платформы — чистая ваниль.
-//   17b. ВАНИЛЬ ВЕДЁТ: путь берётся из BaseAI.FindPath (рельеф, склоны,
-//        вода). Мод НЕ строит свой путь — 2D-сетку 40x40 и A* удалены.
-//   17c. МОД КОНТРОЛИРУЕТ ГАБАРИТ: вдоль ванильного пути выполняется
-//        OverlapBox объёмом платформы (клиренс 1.4 м от земли — низкие
-//        валуны/жилы перешагиваются). Чисто — идём по ванильному пути.
-//   17d. КАСАТЕЛЬНЫЙ ОБЪЕЗД: коробка заблокирована — пробуем отклонения
-//        ±25/45/65° (гистерезис стороны). Ломание — ТОЛЬКО когда объезд
-//        невозможен (это и решает «ломает лишнее»).
-//   17e. СООБЩЕНИЕ «не протиснуться» — только по физическому простою
-//        ≥4.5 с в маршрутном режиме. Никаких сообщений от планировщика.
-//   17f. Ломание: только вперёд (Dot>=0.3), без MineRock, без данжей,
-//        подход в упор (3 м), урон 250 / toolTier 4.
+//  FIX 1: ZNetView_Awake_Postfix не принимает тролля за постройку.
+//  FIX 2: непривязанные куски не изнашиваются; привязанным 5 сек. grace.
+//  FIX 3: непривязанные куски не идут в ванильный расчёт опоры.
+//  FIX 4: TrollPieceZdoIndex не индексирует самих троллей.
+//  FIX 5: Attach не привязывает существ.
+//  FIX 6: пересчёт поддержки отключён при выгрузке сцены.
+//  FIX 9..18: итерации платформенной навигации (сетка -> лучи -> гибрид).
+//  FIX 13: восстановление потерянной платформы (телепорт задирак).
+//
+//  FIX 19 (текущее, ЕДИНАЯ ЛОГИКА ДВИЖЕНИЯ):
+//   19a. Ваниль ведёт ВСЕГДА — и с платформой, и без (pathfinding, обход
+//        углов, idle, следование — родные). Хук BaseAI.MoveTo удалён.
+//   19b. Мод изгибает направление КАЖДОГО шага (патч BaseAI.MoveTowards):
+//        шаг чист -> не трогаем (поведение = тролль без платформы);
+//        заденет -> отклонение ±12/25/40° (гистерезис стороны).
+//   19c. Ломание — ТОЛЬКО при фронтальной стене (все отклонения заняты)
+//        и ТОЛЬКО в режиме маршрута TrollWalk. Подход в упор + удары.
+//   19d. Неразрушимая стена -> широкий веер 55..100°, наименее перекрытое
+//        направление: тролль скользит вдоль, НИКОГДА не стоит на месте.
+//   19e. Клиренс 1.4 м: валуны/жилы/пни перешагиваются. MineRock не
+//        ломаем. Коллайдеры данжей — не цели ломания.
+//   19f. Рантайм: BoxCast каждые 0.12 с вдоль текущего шага + кэш решения;
+//        прогрузившиеся объекты учитываются автоматически.
+//   19g. Сообщение «не протиснуться» — только по факту простоя ≥ 6 с.
 // ============================================================================
 namespace TrollBuildingMod
 {
@@ -148,46 +153,35 @@ namespace TrollBuildingMod
     }
 
     // ========================================================================
-    //  ЛУЧЕВОЙ НАВИГАТОР (FIX 18)
-    //  Алгоритм: толстый луч (BoxCast шириной платформы) ПРЯМО к цели;
-    //  препятствие -> веер альтернативных лучей; свободных мест нет ->
-    //  ломание блокатора. Полный рантайм: пересчёт каждые 0.1 с, никаких
-    //  сеток/A*/запечённых путей — объекты, прогрузившиеся по ходу,
-    //  учитываются автоматически.
-    //  Порядок решений: прямой луч -> малый веер (до 45°) -> ЛОМАНИЕ
-    //  блокатора -> широкий веер (до 150°) -> наименее перекрытое
-    //  направление (скольжение вдоль стены) -> стоп + сообщение.
-    //  Работает только в режиме маршрута TrollWalk при наличии построек.
+    //  ЕДИНЫЙ НАВИГАТОР (FIX 19)
+    //  Ваниль ведёт ВСЕГДА. Мод изгибает направление шага (MoveTowards), если
+    //  платформа заденет препятствие; при фронтальной стене (только в
+    //  режиме маршрута) — ломает блокатор. Стоп-веток нет.
     // ========================================================================
     public class TrollPlatformNavigator
     {
         // ---------- конфигурация ----------
-        private const float MainRayLength = 5.0f;     // главный луч вперёд
-        private const float SideRayLength = 3.5f;     // длина боковых лучей
-        private const float ProbeHalfThick = 0.5f;    // толщина луча вдоль движения
-        private const float SideMargin = 0.25f;      // запас по ширине
-        private const float StepClearance = 1.4f;     // ниже — перешагиваем
-        private const float CastInterval = 0.1f;      // рантайм-пересчёт (10 Гц)
+        private const float MainCastLength = 2.6f;   // взгляд вдоль текущего шага
+        private const float SideCastLength = 1.8f;  // взгляд для отклонений
+        private const float SideMargin = 0.25f;     // запас по ширине
+        private const float StepClearance = 1.4f;   // ниже — перешагиваем
+        private const float CacheTime = 0.12f;      // кэш решения руления
 
-        // малый веер: касательный обход
-        private static readonly float[] SteerAngles = { 10f, 22f, 35f, 45f };
-        // широкий веер: скольжение вокруг не-ломаемых стен
-        private static readonly float[] WideAngles = { 60f, 80f, 100f, 125f, 150f };
+        private static readonly float[] DeflectAngles = { 12f, 25f, 40f };
+        private static readonly float[] WideAngles = { 55f, 70f, 85f, 100f };
 
-        // ломание
-        private const float BreakPickMax = 7f;         // блокатор дальше — не выбираем
-        private const float BreakSwingRange = 3.0f;   // дистанция удара
+        // ломание (только маршрут, только фронтальная стена)
+        private const float BreakPickMax = 6f;
+        private const float BreakSwingRange = 3f;
         private const float BreakSwingInterval = 1.15f;
         private const float BreakDamage = 250f;
         private const int BreakToolTier = 4;
-        private const float BreakTimeout = 25f;       // от последнего удара
-        private const float ForwardDotMin = 0.25f;    // цель только впереди
+        private const float BreakTimeout = 25f;      // от последнего удара
+        private const float ForwardDotMin = 0.25f;
         private const float FailedTreeMemory = 30f;
         private const float FailedTreeRadius = 3f;
-
-        // простой/сообщения
-        private const float StallMsgTime = 6f;         // секунд стояния до сообщения
-        private const float StallSideFlip = 3f;        // смена стороны объезда при простое
+        private const float StallMsgTime = 6f;
+        private const float StallSideFlip = 3f;       // смена стороны при простое
         private const float DiagLogInterval = 3f;
 
         // габарит
@@ -220,7 +214,6 @@ namespace TrollBuildingMod
             return null;
         }
 
-        // коллайдеры архитектуры данжей — не цели ломания
         private static bool IsDungeonCollider(Collider c)
         {
             string n = c.gameObject.name;
@@ -239,21 +232,16 @@ namespace TrollBuildingMod
 
         private readonly TrollPiecesContainer m_owner;
 
-        // рантайм-состояние (пересчитывается каждые CastInterval)
-        private float m_lastCast = -1f;
-        private bool m_moveDirValid;
-        private Vector3 m_moveDir;
-        private Collider m_forwardBlocker;      // ближайшее чужое, что перекрыло главный луч
-        private bool m_wideFreeValid;
-        private Vector3 m_wideFreeDir;
-        private bool m_leastDirValid;
-        private Vector3 m_leastDir;
-        private float m_leastFree;
+        // кэш руления
+        private bool m_cacheValid;
+        private Vector3 m_cacheIn;
+        private Vector3 m_cacheOut;
+        private float m_cacheTime;
 
-        private int m_steerSide;                // гистерезис стороны (—1/0/+1)
+        private int m_steerSide;                 // гистерезис стороны (—1/0/+1)
         private float m_stallTimer;
+        private float m_stallFlipMark;
         private Vector3 m_lastStallPos;
-        private float m_lastFlipMark;
         private float m_lastBlockedMsg = -30f;
         private float m_lastTreeMsg = -30f;
         private float m_lastDiagLog = -30f;
@@ -264,6 +252,7 @@ namespace TrollBuildingMod
         private float m_nextSwing;
         private int m_swingCount;
         private readonly List<Vector3> m_failedTreePos = new List<Vector3>();
+        private readonly List<float> m_failedTreeTime = new List<float>();
 
         // выпеченный габарит
         private int m_footVersion = -1;
@@ -284,19 +273,10 @@ namespace TrollBuildingMod
         public void Invalidate()
         {
             m_footVersion = -1;
+            m_cacheValid = false;
         }
 
         public bool IsBreaking => m_break != null;
-
-        public void OnRouteEnded()
-        {
-            m_break = null;
-            m_steerSide = 0;
-            m_stallTimer = 0f;
-            m_moveDirValid = false;
-            m_wideFreeValid = false;
-            m_leastDirValid = false;
-        }
 
         public float FootprintRadius
         {
@@ -304,196 +284,173 @@ namespace TrollBuildingMod
         }
 
         // ====================================================================
-        //  Основной вход (патч BaseAI.MoveTo; вызывается только в режиме
-        //  маршрута TrollWalk при наличии построек — гейт в хуке).
+        //  ВХОД: изгиб направления шага (патч BaseAI.MoveTowards)
         // ====================================================================
-        public bool DriveMoveTo(BaseAI ai, float dt, Vector3 point, float dist, bool run)
+        public void HandleMoveTowards(BaseAI ai, ref Vector3 dir)
         {
-            Vector3 pos = ai.transform.position;
-            float arrive = Mathf.Max(dist, run ? 1f : 0.5f);
-            if (Utils.DistanceXZ(point, pos) <= arrive)
-            {
-                ai.StopMoving();
-                m_break = null;
-                m_stallTimer = 0f;
-                return true;
-            }
+            Vector3 flat = new Vector3(dir.x, 0f, dir.z);
+            if (flat.sqrMagnitude < 1e-6f) return; // ваниль решила стоять — не трогаем
+            flat.Normalize();
 
             if (m_break != null)
-                return UpdateBreaking(ai, dt);
-
-            Vector3 to = point - pos;
-            to.y = 0f;
-            float d = to.magnitude;
-            if (d < 0.05f)
             {
-                ai.StopMoving();
-                TrackStall(pos, dt);
-                return false;
-            }
-            Vector3 dir = to / d;   // луч ПРЯМО к цели
-
-            // рантайм-пересчёт лучей (прогрузка объектов учитывается сама)
-            if (Time.time - m_lastCast >= CastInterval)
-            {
-                m_lastCast = Time.time;
-                Recast(pos, dir);
+                HandleBreaking(ai, ref dir);
+                TrackStall(ai);
+                return;
             }
 
-            // 1) прямой либо касательный коридор найден — идём
-            if (m_moveDirValid)
+            // кэш: направление почти не изменилось — применяем готовое решение
+            if (m_cacheValid && Time.time - m_cacheTime < CacheTime &&
+                Vector3.Dot(m_cacheIn, flat) > 0.95f)
             {
-                ai.MoveTowards(m_moveDir, run);
-                TrackStall(pos, dt);
-                return false;
+                dir = m_cacheOut;
+                TrackStall(ai);
+                return;
             }
 
-            // 2) всё перекрыто на малых углах — ломаем блокатор главного луча
-            if (m_forwardBlocker != null && TryStartBreaking(ai, pos, dir))
-                return false;
+            Vector3 pos = ai.transform.position;
+            m_cacheTime = Time.time;
+            m_cacheIn = flat;
 
-            // 3) блокатор не ломается — широкий свободный коридор
-            if (m_wideFreeValid)
+            // 1) текущий шаг чист -> ваниль без изменений
+            float free = CastDir(pos, flat, MainCastLength, out Collider blocker);
+            if (free >= MainCastLength)
             {
-                ai.MoveTowards(m_wideFreeDir, run);
-                TrackStall(pos, dt);
-                return false;
+                m_cacheOut = flat;
+                m_cacheValid = true;
+                m_steerSide = 0;
+                TrackStall(ai);
+                return;
             }
 
-            // 4) не ломается и всё перекрыто — скользим вдоль стены
-            //    (наименее перекрытое направление — НИКОГДА не стоим на месте)
-            if (m_leastDirValid)
-            {
-                ai.MoveTowards(m_leastDir, run);
-                TrackStall(pos, dt);
-                return false;
-            }
-
-            ai.StopMoving();
-            TrackStall(pos, dt);
-            return false;
-        }
-
-        // ====================================================================
-        //  РУНТАЙМ-ПЕРЕСЧЁТ ЛУЧЕЙ
-        // ====================================================================
-        private void Recast(Vector3 pos, Vector3 dir)
-        {
-            m_moveDirValid = false;
-            m_wideFreeValid = false;
-            m_leastDirValid = false;
-            m_forwardBlocker = null;
-            m_leastFree = -1f;
-
-            // главный луч прямо к цели
-            float fwd = CastDir(pos, dir, MainRayLength, out Collider fwdBlocker);
-            m_forwardBlocker = fwdBlocker;
-            m_leastDir = dir;
-            m_leastFree = fwd;
-
-            if (fwdBlocker == null)
-            {
-                m_moveDir = dir;
-                m_moveDirValid = true;
-                return; // путь чист
-            }
-
+            // 2) отклонения (предпочтительная сторона первой)
             int pref = m_steerSide >= 0 ? 1 : -1;
-
-            // малый веер: касательный обход (предпочтительная сторона первой)
             for (int s = 0; s < 2; s++)
             {
                 float sign = s == 0 ? pref : -pref;
-                foreach (float a in SteerAngles)
+                foreach (float a in DeflectAngles)
                 {
-                    Vector3 cand = Quaternion.Euler(0f, a * sign, 0f) * dir;
-                    if (CastDir(pos, cand, SideRayLength, out _) >= SideRayLength - 0.01f)
+                    Vector3 cand = Quaternion.Euler(0f, a * sign, 0f) * flat;
+                    if (CastDir(pos, cand, SideCastLength, out _) >= SideCastLength)
                     {
-                        m_moveDir = cand;
-                        m_moveDirValid = true;
+                        m_cacheOut = cand;
+                        m_cacheValid = true;
                         m_steerSide = (int)sign;
-                        return; // обход найден — ломание не нужно
+                        dir = cand;
+                        TrackStall(ai);
+                        return;
                     }
                 }
             }
 
-            // малых углов нет: главный блокатор пойдёт на ломание (в DriveMoveTo),
-            // здесь готовим широкий веер — запасной путь для не-ломаемых стен
-            for (int s = 0; s < 2; s++)
+            // 3) фронтальная стена -> ломание (только режим маршрута)
+            if (blocker != null && IsRouteActive() &&
+                TryStartBreaking(ai, pos, flat, blocker))
+            {
+                m_cacheValid = false;
+                HandleBreaking(ai, ref dir);
+                TrackStall(ai);
+                return;
+            }
+
+            // 4) не ломается / не маршрут -> широкий веер; НИКОГДА не стоим:
+            //    свободный коридор либо наименее перекрытое направление
+            Vector3 best = flat;
+            float bestFree = free;
+            bool wideFound = false;
+            for (int s = 0; s < 2 && !wideFound; s++)
             {
                 float sign = s == 0 ? pref : -pref;
                 foreach (float a in WideAngles)
                 {
-                    Vector3 cand = Quaternion.Euler(0f, a * sign, 0f) * dir;
-                    float free = CastDir(pos, cand, SideRayLength, out _);
-
-                    if (free >= SideRayLength - 0.01f)
+                    Vector3 cand = Quaternion.Euler(0f, a * sign, 0f) * flat;
+                    float f = CastDir(pos, cand, SideCastLength, out _);
+                    if (f >= SideCastLength)
                     {
-                        m_wideFreeDir = cand;
-                        m_wideFreeValid = true;
-                        break; // первый свободный широкий коридор достаточен
+                        best = cand;
+                        wideFound = true;
+                        break;
                     }
-                    if (free > m_leastFree + 0.5f)
+                    if (f > bestFree + 0.3f)
                     {
-                        m_leastFree = free;
-                        m_leastDir = cand;
-                        m_leastDirValid = true;
+                        bestFree = f;
+                        best = cand;
                     }
                 }
-                if (m_wideFreeValid) break;
             }
+
+            m_cacheOut = best;
+            m_cacheValid = true;
+            if (wideFound) m_steerSide = 0;
+            dir = best;
+            TrackStall(ai);
         }
 
-        // Толстый луч = BoxCast шириной платформы, высотой её спана,
-        // с клиренсом StepClearance (низкие валуны/жилы не видит — перешагиваем).
-        // Возвращает свободную длину (== length, если чисто) и ближайший
-        // ЧУЖОЙ блокатор.
-        private float CastDir(Vector3 pos, Vector3 dir, float length, out Collider blocker)
+        // ====================================================================
+        //  ЛОМАНИЕ: подводим тролля к цели и бьём (через тот же изгиб шага)
+        // ====================================================================
+        private void HandleBreaking(BaseAI ai, ref Vector3 dir)
         {
-            blocker = null;
-            BakeFootprintIfNeeded();
-            float ground = GroundY(pos);
-            Vector3 origin = new Vector3(pos.x, ground + m_spanMid, pos.z)
-                + dir * (ProbeHalfThick + 0.1f);
-            Vector3 half = new Vector3(m_boxHalfX + SideMargin, m_spanHalf + 0.1f, ProbeHalfThick);
-
-            int n = Physics.BoxCastNonAlloc(origin, half, dir, s_castHits,
-                Quaternion.LookRotation(dir), length, ObstacleMask, QueryTriggerInteraction.Ignore);
-
-            float nearest = float.MaxValue;
-            for (int i = 0; i < n; i++)
+            if (ai.GetTargetCreature() != null || !IsRouteActive())
             {
-                Collider c = s_castHits[i].collider;
-                if (!IsForeign(c)) continue;
-                if (s_castHits[i].distance < nearest)
-                {
-                    nearest = s_castHits[i].distance;
-                    blocker = c;
-                }
+                CancelBreak("combat or route ended");
+                return;
             }
-            return blocker == null ? length : nearest;
+
+            MonoBehaviour comp = m_break?.Comp;
+            if (comp == null || !comp)
+            {
+                CancelBreak("target gone");
+                m_cacheValid = false;
+                return;
+            }
+
+            if (Time.time - m_lastLandedSwing > BreakTimeout)
+            {
+                RememberFailedTree(m_break.Pos);
+                CancelBreak("timeout");
+                m_steerSide = -m_steerSide; // следующий подход — другой стороной
+                m_cacheValid = false;
+                return;
+            }
+
+            Vector3 pos = ai.transform.position;
+            Vector3 to = m_break.Pos - pos;
+            to.y = 0f;
+            float d = to.magnitude;
+
+            // направляем тролля к цели ломания (не нулевой вектор — защита от
+            // NaN в ванильном MoveTowards); в радиусе удара дерево само
+            // удержит тело, тролль прижимается к нему и бьёт
+            if (d > 0.05f)
+                dir = to / d;
+            else
+                dir = ai.transform.forward;
+
+            if (d <= BreakSwingRange && Time.time >= m_nextSwing)
+            {
+                m_nextSwing = Time.time + BreakSwingInterval;
+
+                Character ch = m_owner.TrollCharacter;
+                bool visual = false;
+                if (ch != null && !ch.InAttack())
+                {
+                    try { visual = ch.StartAttack(null, false); } catch { }
+                }
+
+                m_swingCount++;
+                m_lastLandedSwing = Time.time;
+                ApplyBreakDamage();
+                Debug.Log($"[TrollBuild] Break swing #{m_swingCount} on " +
+                          $"'{comp.gameObject.name}' (visual={visual})");
+            }
         }
 
-        // ====================================================================
-        //  ЛОМАНИЕ — блокатор главного луча, когда обход малыми углами невозможен
-        // ====================================================================
-        private bool TryStartBreaking(BaseAI ai, Vector3 pos, Vector3 dir)
+        private bool TryStartBreaking(BaseAI ai, Vector3 pos, Vector3 dir, Collider c)
         {
             if (m_owner.TrollCharacter == null) return false;
             if (m_owner.TrollCharacter.IsDead()) return false;
-
-            if (ai.GetTargetCreature() != null)
-            {
-                if (Time.time - m_lastDiagLog > DiagLogInterval)
-                {
-                    m_lastDiagLog = Time.time;
-                    Debug.Log("[TrollBuild] Break suppressed: troll has target creature '" +
-                              ai.GetTargetCreature().name + "'");
-                }
-                return false;
-            }
-
-            Collider c = m_forwardBlocker;
+            if (ai.GetTargetCreature() != null) return false;
             if (IsDungeonCollider(c)) return false;
 
             MonoBehaviour mb = FindBreakableComponent(c);
@@ -502,7 +459,7 @@ namespace TrollBuildingMod
                 if (Time.time - m_lastDiagLog > DiagLogInterval)
                 {
                     m_lastDiagLog = Time.time;
-                    Debug.Log("[TrollBuild] Ray blocked by NON-breakable: " +
+                    Debug.Log("[TrollBuild] Frontal wall NON-breakable: " +
                               c.gameObject.name + "/" + LayerMask.LayerToName(c.gameObject.layer));
                 }
                 return false;
@@ -516,8 +473,6 @@ namespace TrollBuildingMod
             if (IsRecentlyFailedTree(mb.transform.position)) return false;
 
             Vector3 cp = ClosestPointOn(c, pos);
-
-            // цель — только впереди по ходу движения
             Vector3 to = cp - pos;
             to.y = 0f;
             if (to.sqrMagnitude < 0.01f) return false;
@@ -526,18 +481,13 @@ namespace TrollBuildingMod
             float d = Utils.DistanceXZ(cp, pos);
             if (d > BreakPickMax) return false;
 
-            m_break = new BreakTarget
-            {
-                Comp = mb,
-                Destructible = mb as IDestructible,
-                Pos = cp
-            };
+            m_break = new BreakTarget { Comp = mb, Destructible = mb as IDestructible, Pos = cp };
             m_lastLandedSwing = Time.time;
             m_nextSwing = 0f;
             m_swingCount = 0;
 
             Debug.Log($"[TrollBuild] Break START: '{mb.gameObject.name}' " +
-                      $"({mb.GetType().Name}) dist={d:F1} (no free rays)");
+                      $"({mb.GetType().Name}) dist={d:F1} (frontal wall, no side room)");
 
             if (Time.time - m_lastTreeMsg > 10f)
             {
@@ -549,101 +499,11 @@ namespace TrollBuildingMod
             return true;
         }
 
-        private static Vector3 ClosestPointOn(Collider c, Vector3 to)
+        private void CancelBreak(string reason)
         {
-            try
-            {
-                MeshCollider mc = c as MeshCollider;
-                if (mc == null || mc.convex)
-                    return c.ClosestPoint(to);
-            }
-            catch { }
-            return c.bounds.ClosestPoint(to);
-        }
-
-        // БЕЗ MineRock/MineRock5 — низкое перешагивается (клиренс),
-        // высокое объезжается веером.
-        private static MonoBehaviour FindBreakableComponent(Collider c)
-        {
-            Component comp = c.GetComponentInParent<TreeBase>();
-            if (comp == null && s_treeSyncType != null) comp = c.GetComponentInParent(s_treeSyncType);
-            if (comp == null && s_treeLogType != null) comp = c.GetComponentInParent(s_treeLogType);
-            if (comp == null) comp = c.GetComponentInParent<Destructible>();
-            if (comp is MonoBehaviour mb && mb is IDestructible) return mb;
-            return null;
-        }
-
-        private bool IsRecentlyFailedTree(Vector3 p)
-        {
-            for (int i = 0; i < m_failedTreePos.Count; i++)
-                if (Utils.DistanceSqr(m_failedTreePos[i], p) < FailedTreeRadius * FailedTreeRadius)
-                    return true;
-            return false;
-        }
-
-        private void RememberFailedTree(Vector3 p)
-        {
-            if (IsRecentlyFailedTree(p)) return;
-            m_failedTreePos.Add(p);
-            if (m_failedTreePos.Count > 16) m_failedTreePos.RemoveAt(0);
-        }
-
-        private bool UpdateBreaking(BaseAI ai, float dt)
-        {
-            // бой важнее ломания
-            if (ai.GetTargetCreature() != null)
-            {
-                m_break = null;
-                return false;
-            }
-
-            // цель исчезла (повалена) — лучи пересчитаются, маршрут продолжится
-            if (m_break == null || m_break.Comp == null || !m_break.Comp)
-            {
-                Debug.Log("[TrollBuild] Break: target gone, resuming route");
-                m_break = null;
-                m_lastCast = -1f; // форсируем немедленный пересчёт лучей
-                return false;
-            }
-
-            // таймаут от последнего НАНЕСЁННОГО удара
-            if (Time.time - m_lastLandedSwing > BreakTimeout)
-            {
-                Debug.Log($"[TrollBuild] Break TIMEOUT on '{m_break.Comp.gameObject.name}' " +
-                          $"after {m_swingCount} swings");
-                RememberFailedTree(m_break.Pos);
-                m_break = null;
-                m_steerSide = -m_steerSide; // при простое пробуем другую сторону
-                m_lastCast = -1f;
-                return false;
-            }
-
-            Vector3 pos = ai.transform.position;
-            Vector3 to = m_break.Pos - pos;
-            to.y = 0f;
-            float d = to.magnitude;
-
-            if (d > BreakSwingRange * 0.85f && d > 0.05f)
-                ai.MoveTowards(to / d, false);
-
-            Character ch = m_owner.TrollCharacter;
-            if (ch != null && d <= BreakSwingRange && Time.time >= m_nextSwing)
-            {
-                m_nextSwing = Time.time + BreakSwingInterval;
-
-                bool visual = false;
-                if (!ch.InAttack())
-                {
-                    try { visual = ch.StartAttack(null, false); } catch { }
-                }
-
-                m_swingCount++;
-                m_lastLandedSwing = Time.time;
-                ApplyBreakDamage();
-                Debug.Log($"[TrollBuild] Break swing #{m_swingCount} on " +
-                          $"'{m_break.Comp.gameObject.name}' (visual={visual})");
-            }
-            return false;
+            if (m_break != null)
+                Debug.Log($"[TrollBuild] Break cancel ({reason})");
+            m_break = null;
         }
 
         private void ApplyBreakDamage()
@@ -666,33 +526,116 @@ namespace TrollBuildingMod
         }
 
         // ====================================================================
-        //  Простой: сообщение ТОЛЬКО по факту стояния; смена стороны объезда
+        //  Толстый луч = BoxCast шириной платформы, с клиренсом StepClearance
+        //  (низкие валуны/жилы не видит — перешагиваем). Возвращает свободную
+        //  длину (== length, если чисто) и ближайший ЧУЖОЙ блокатор.
         // ====================================================================
-        private void TrackStall(Vector3 pos, float dt)
+        private float CastDir(Vector3 pos, Vector3 dir, float length, out Collider blocker)
         {
+            blocker = null;
+            BakeFootprintIfNeeded();
+            float ground = GroundY(pos);
+            // старт за передним краем платформы: то, чем уже зацепились, не считаем
+            Vector3 origin = new Vector3(pos.x, ground + m_spanMid, pos.z)
+                + dir * (m_boxHalfX + 0.3f);
+            Vector3 half = new Vector3(m_boxHalfX + SideMargin, m_spanHalf + 0.1f, 0.5f);
+
+            int n = Physics.BoxCastNonAlloc(origin, half, dir, s_castHits,
+                Quaternion.LookRotation(dir), length, ObstacleMask, QueryTriggerInteraction.Ignore);
+
+            float nearest = float.MaxValue;
+            for (int i = 0; i < n; i++)
+            {
+                Collider c = s_castHits[i].collider;
+                if (!IsForeign(c)) continue;
+                if (s_castHits[i].distance < nearest)
+                {
+                    nearest = s_castHits[i].distance;
+                    blocker = c;
+                }
+            }
+            return blocker == null ? length : nearest;
+        }
+
+        private static Vector3 ClosestPointOn(Collider c, Vector3 to)
+        {
+            try
+            {
+                MeshCollider mc = c as MeshCollider;
+                if (mc == null || mc.convex)
+                    return c.ClosestPoint(to);
+            }
+            catch { }
+            return c.bounds.ClosestPoint(to);
+        }
+
+        // БЕЗ MineRock/MineRock5: низкое перешагивается (клиренс),
+        // высокое объезжается веером.
+        private static MonoBehaviour FindBreakableComponent(Collider c)
+        {
+            Component comp = c.GetComponentInParent<TreeBase>();
+            if (comp == null && s_treeSyncType != null) comp = c.GetComponentInParent(s_treeSyncType);
+            if (comp == null && s_treeLogType != null) comp = c.GetComponentInParent(s_treeLogType);
+            if (comp == null) comp = c.GetComponentInParent<Destructible>();
+            if (comp is MonoBehaviour mb && mb is IDestructible) return mb;
+            return null;
+        }
+
+        private bool IsRecentlyFailedTree(Vector3 p)
+        {
+            for (int i = m_failedTreePos.Count - 1; i >= 0; i--)
+                if (Time.time - m_failedTreeTime[i] > FailedTreeMemory)
+                {
+                    m_failedTreePos.RemoveAt(i);
+                    m_failedTreeTime.RemoveAt(i);
+                }
+            for (int i = 0; i < m_failedTreePos.Count; i++)
+                if (Utils.DistanceSqr(m_failedTreePos[i], p) < FailedTreeRadius * FailedTreeRadius)
+                    return true;
+            return false;
+        }
+
+        private void RememberFailedTree(Vector3 p)
+        {
+            if (IsRecentlyFailedTree(p)) return;
+            m_failedTreePos.Add(p);
+            m_failedTreeTime.Add(Time.time);
+            if (m_failedTreePos.Count > 16)
+            {
+                m_failedTreePos.RemoveAt(0);
+                m_failedTreeTime.RemoveAt(0);
+            }
+        }
+
+        // ====================================================================
+        //  Простой: сообщение только по факту; при простое — смена стороны
+        // ====================================================================
+        private void TrackStall(BaseAI ai)
+        {
+            Vector3 pos = ai.transform.position;
             if (Utils.DistanceXZ(pos, m_lastStallPos) < 0.15f)
             {
-                m_stallTimer += dt;
+                m_stallTimer += Time.deltaTime;
 
-                // раз в StallSideFlip секунд простоя — пробуем другую сторону
-                if (m_stallTimer - m_lastFlipMark > StallSideFlip)
+                // раз в StallSideFlip секунд простоя пробуем другую сторону
+                if (m_stallTimer - m_stallFlipMark > StallSideFlip)
                 {
-                    m_lastFlipMark = m_stallTimer;
+                    m_stallFlipMark = m_stallTimer;
                     m_steerSide = -m_steerSide;
-                    m_lastCast = -1f; // немедленный пересчёт лучей с новой стороны
+                    m_cacheValid = false; // немедленный пересчёт с новой стороны
                 }
 
                 if (m_stallTimer > StallMsgTime)
                 {
                     m_stallTimer = 0f;
-                    m_lastFlipMark = 0f;
+                    m_stallFlipMark = 0f;
                     NotifyBlocked();
                 }
             }
             else
             {
                 m_stallTimer = 0f;
-                m_lastFlipMark = 0f;
+                m_stallFlipMark = 0f;
                 m_lastStallPos = pos;
             }
         }
@@ -704,6 +647,18 @@ namespace TrollBuildingMod
             Player.m_localPlayer?.Message(MessageHud.MessageType.TopLeft,
                 TrollWalkLoc.T("The troll cannot squeeze through with its platform",
                     "Тролль не может протиснуться с платформой"), 0, null, false);
+        }
+
+        private bool IsRouteActive()
+        {
+            try
+            {
+                ZNetView nv = m_owner.GetComponent<ZNetView>();
+                if (nv == null || !nv.IsValid()) return false;
+                ZDO zdo = nv.GetZDO();
+                return zdo != null && zdo.GetBool(TrollWalkConstants.HashActive, false);
+            }
+            catch { return false; }
         }
 
         // ====================================================================
@@ -1933,50 +1888,32 @@ namespace TrollBuildingMod
         }
 
         // ================================================================
-        //  FIX 17a: ГИБРИДНЫЙ ГЕЙТ. Навигатор и ломание — ТОЛЬКО в режиме
-        //  маршрута TrollWalk (ZDO-флаг) и ТОЛЬКО при наличии построек.
-        //  Следование/охрана/idle/дикий тролль/без платформы — чистая ваниль.
+        //  FIX 19: ЕДИНАЯ ЛОГИКА ДВИЖЕНИЯ. Ваниль ведёт всегда — и с
+        //  платформой, и без неё (pathfinding, обход углов, idle — родные).
+        //  Мод лишь ИЗГИБАЕТ направление шага (MoveTowards — единственная
+        //  точка любого AI-движения), если платформа заденет препятствие;
+        //  ломает блокатор только при фронтальной стене и только в режиме
+        //  маршрута TrollWalk.
         // ================================================================
-        [HarmonyPatch(typeof(BaseAI), "MoveTo")]
+        [HarmonyPatch(typeof(BaseAI), "MoveTowards")]
         [HarmonyPrefix]
-        private static bool BaseAI_MoveTo_Prefix(
-            BaseAI __instance, float dt, Vector3 point, float dist, bool run, ref bool __result)
+        private static void BaseAI_MoveTowards_Prefix(BaseAI __instance, ref Vector3 dir, bool run)
         {
             try
             {
-                if (__instance == null) return true;
-                if (!__instance.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase)) return true;
+                if (__instance == null) return;
+                Vector3 flat = new Vector3(dir.x, 0f, dir.z);
+                if (flat.sqrMagnitude < 1e-6f) return;
+                if (!__instance.name.StartsWith("Troll", StringComparison.OrdinalIgnoreCase)) return;
                 TrollPiecesContainer container = __instance.GetComponent<TrollPiecesContainer>();
-                if (container == null) return true;
+                if (container == null || container.PieceCount == 0) return; // без платформы — ваниль
 
-                if (container.PieceCount == 0) return true; // без платформы — ваниль
-
-                if (!IsRouteActive(container))
-                {
-                    container.Navigator.OnRouteEnded(); // маршрут кончился — сброс ломания
-                    return true; // следование/охрана — чистая ваниль
-                }
-
-                __result = container.Navigator.DriveMoveTo(__instance, dt, point, dist, run);
-                return false;
+                container.Navigator.HandleMoveTowards(__instance, ref dir);
             }
             catch (Exception e)
             {
-                Debug.LogWarning("[TrollBuild] Hybrid MoveTo failed, falling back to vanilla: " + e.Message);
-                return true;
+                Debug.LogWarning("[TrollBuild] Steering failed: " + e.Message);
             }
-        }
-
-        private static bool IsRouteActive(TrollPiecesContainer container)
-        {
-            try
-            {
-                ZNetView nv = container.GetComponent<ZNetView>();
-                if (nv == null || !nv.IsValid()) return false;
-                ZDO zdo = nv.GetZDO();
-                return zdo != null && zdo.GetBool(TrollWalkConstants.HashActive, false);
-            }
-            catch { return false; }
         }
 
         [HarmonyPatch(typeof(Player), "PieceRayTest")]
@@ -2507,6 +2444,7 @@ namespace TrollBuildingMod
             if (zdo == null) return;
             if (__instance.GetComponent<TrollPieceTag>() != null) return;
 
+            // FIX 1: сам тролль не является постройкой
             if (__instance.GetComponent<Character>() != null) return;
             if (__instance.GetComponent<TrollPiecesContainer>() != null) return;
             if (__instance.GetComponent<Piece>() == null) return;
