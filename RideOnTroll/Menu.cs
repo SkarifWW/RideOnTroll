@@ -421,19 +421,12 @@ namespace TrollTamerMod
             {
                 flat.Normalize();
                 m_hitDir = flat;
-                if (Vector3.Dot(transform.forward, flat) < 0.35f)
-                {
-                    m_ai?.StopMoving();
-                    try { s_lookAt?.Invoke(m_ai, new object[] { point }); } catch { }
-                    m_faceTimer += dt;
-                    if (m_faceTimer < FaceTimeout) return;
-                }
+                try { s_lookAt?.Invoke(m_ai, new object[] { point }); } catch { }
             }
-            m_faceTimer = 0f;
 
             m_ai?.StopMoving();
-            try { s_lookAt?.Invoke(m_ai, new object[] { point }); } catch { }
 
+            // Если стоим вплотную (dist <= AttackRange), таймер удара тикает гарантированно
             m_attackTimer += dt;
             if (m_attackTimer >= AttackInterval)
             {
@@ -460,16 +453,20 @@ namespace TrollTamerMod
             for (int i = 0; i < m_targetCols.Length; i++)
             {
                 Collider c = m_targetCols[i];
-                if (c == null || !c.enabled || !c.gameObject.activeInHierarchy) continue;
+                if (c == null || !c.enabled || !c.gameObject.activeInHierarchy || c.isTrigger) continue;
 
                 Vector3 p;
                 MeshCollider mc = c as MeshCollider;
                 if (mc != null && !mc.convex)
                 {
-                    Vector3 to = mc.bounds.center - from;
+                    // Ограничиваем высоту цели уровнем груди тролля (горизонтальный луч в ствол)
+                    Vector3 targetCenter = mc.bounds.center;
+                    targetCenter.y = Mathf.Clamp(from.y, mc.bounds.min.y, mc.bounds.max.y);
+
+                    Vector3 to = targetCenter - from;
                     if (to.sqrMagnitude < 0.04f) continue;
                     RaycastHit rh;
-                    if (!Physics.Raycast(from, to.normalized, out rh, to.magnitude + 0.5f,
+                    if (!Physics.Raycast(from, to.normalized, out rh, to.magnitude + 1.5f,
                             s_searchMask, QueryTriggerInteraction.Collide)) continue;
                     if (!rh.transform.IsChildOf(m_target.transform)) continue;
                     p = rh.point;
@@ -649,7 +646,9 @@ namespace TrollTamerMod
                 HitData hit = new HitData();
                 hit.m_damage.m_damage = AttackDamage;
                 hit.m_damage.m_pickaxe = AttackDamage;
-                hit.m_toolTier = AttackToolTier;
+                hit.m_damage.m_chop = AttackDamage; // Берёза и дуб принимают ТОЛЬКО этот тип урона
+                hit.m_toolTier = (short)AttackToolTier;
+                hit.SetAttacker(m_character);        // Задаём тролля атакующим (нужно для проверок TreeBase)
 
                 if (mb is MineRock || mb is MineRock5)
                 {
