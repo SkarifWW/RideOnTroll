@@ -8,33 +8,7 @@ using UnityEngine;
 using UnityEngine.UI;
 
 // ============================================================================
-//  MENU.CS v9 — Радиальное меню (в стиле ванильного) + добыча ресурсов v2.
-//
-//  Y на тролле — открыть. Верх: Не двигаться | Лево: Лес | Право: Камень | Низ: Маршрут
-//  Наведение на Лес/Камень (0.15с) раскрывает подпункты. ЛКМ — выбор.
-//  ПКМ / Y / Esc — закрыть. Иконки — Embedded Resources.
-//
-//  ДОБЫЧА v2 (полная переработка алгоритма):
-//   - ПОИСК: плотная маска слоёв (Default/static_solid/Default_small — только
-//     природные твёрдые объекты, те же слои что видит pathfinding), буфер 1024;
-//     куски построек / предметы / дым больше не забивают буфер — деревья и
-//     камни видны всегда. Проверка достижимости (BaseAI.HavePath) + блэклист
-//     недостижимых целей на 60 с (как CompanionAI в моде Companions).
-//   - ДИСТАНЦИЯ: до РЕАЛЬНОЙ поверхности цели, не до AABB! Для не-выпуклых
-//     MeshCollider (все валуны, MineRock/MineRock5) поверхность берётся
-//     рейкастом от груди к центру меша — раньше AABB врал на метры, и тролль
-//     «бил» с огромной дистанции. AttackRange 3.2 — только вплотную.
-//   - УДАР: анимация всегда (StartAttack, фоллбэк zanim "attack" — безоружному
-//     троллю StartAttack возвращает false). Урон — контроллером, по истинной
-//     точке поверхности (+0.3 м внутрь для зон MineRock5). AOE-размах по
-//     соседним целям того же типа (аналог TryApplyTreeAoe/TryApplyRockAoe
-//     из HarvestController мода Companions).
-//   - ДВОЙНОЙ УРОН: ванильный физический удар кулаков по текущей цели добычи
-//     подавляется патчами TrollGatherDamagePatches (зеркало схемы
-//     Companions.CombatPatches «SuppressHarvestPhysical») — урон контроллера
-//     авторитетен, нет спама «Too Hard» от тир-0 кулаков.
-//   - КЛАССИФИКАЦИЯ: дроп-таблицы + имена префабов + фоллбэк по резистам
-//     Destructible.m_damages (как Companions.GetHarvestable).
+//  MENU.CS v10 — Радиальное меню + добыча ресурсов v2 (фикс жил и руды).
 // ============================================================================
 namespace TrollTamerMod
 {
@@ -67,6 +41,12 @@ namespace TrollTamerMod
 
         private static readonly Type s_treeLogType = FindTypeByName("TreeLog");
         private static readonly Type s_treeSyncType = FindTypeByName("TreeSync");
+
+        public static void ClearCache()
+        {
+            s_matchCache.Clear();
+            s_dropCache.Clear();
+        }
 
         private static Type FindTypeByName(string name)
         {
@@ -149,15 +129,12 @@ namespace TrollTamerMod
                 foreach (string d in drops)
                     if (string.Equals(d, token, StringComparison.OrdinalIgnoreCase))
                         return true;
-                return false;
             }
+
             if (FallbackNameMatch(prefab, type)) return true;
-            return FallbackByDamageType(destr, type);   // НОВОЕ: по резистам
+            return FallbackByDamageType(destr, type);
         }
 
-        // ВСЕ таблицы дропа со ВСЕЙ иерархии, БЕЗ break.
-        // У rock4_copper DropOnDestroyed основания дропает камень, а руда —
-        // в таблице самого MineRock5. Первый найденный раньше давал break.
         private static string[] GetDropNames(string prefab, MonoBehaviour sample)
         {
             if (s_dropCache.ContainsKey(prefab)) return s_dropCache[prefab];
@@ -183,7 +160,6 @@ namespace TrollTamerMod
             return result;
         }
 
-        // Рекурсивный обход полей: СТРУКТУРЫ ТОЖЕ (DropTable.DropData — структура!)
         private static void CollectFromValue(object val, HashSet<string> names, HashSet<object> visited, int depth)
         {
             if (val == null || depth > 5 || names.Count > 32) return;
@@ -203,7 +179,8 @@ namespace TrollTamerMod
                 return;
             }
 
-            if (val is UnityEngine.Object) return;
+            // На нулевой глубине разрешаем инспектировать входной Component/MonoBehaviour
+            if (depth > 0 && val is UnityEngine.Object) return;
 
             Type t = val.GetType();
             if (t.IsPrimitive || t == typeof(string) || t.IsEnum) return;
@@ -225,15 +202,11 @@ namespace TrollTamerMod
             }
         }
 
-        // НОВОЕ: «модификатор урона работает?» (не Immune/Ignore)
         private static bool WorksOn(HitData.DamageModifier m)
         {
             return m != HitData.DamageModifier.Immune && m != HitData.DamageModifier.Ignore;
         }
 
-        // НОВОЕ: классификация по резистам Destructible.m_damages
-        // (та же логика, что в Companions.GetHarvestable) — ловит стволы/пни/
-        // камни, которых нет ни в дроп-таблице, ни в списках имён
         private static bool FallbackByDamageType(MonoBehaviour destr, GatherType type)
         {
             Destructible d = destr as Destructible;
@@ -242,13 +215,11 @@ namespace TrollTamerMod
             bool pick = WorksOn(d.m_damages.m_pickaxe);
             switch (type)
             {
-                case GatherType.Wood: return chop;          // любой рубимый ствол/пень
-                case GatherType.Stone: return pick && !chop; // только кирко-чувствительное
-                default: return false;  // FineWood/CoreWood/Copper — только дроп/имя
+                case GatherType.Wood: return chop;
+                case GatherType.Stone: return pick && !chop;
+                default: return false;
             }
         }
-
-        // фоллбэк по точным именам (если дроп не читается)
 
         private static readonly HashSet<string> FallbackWood = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { "Beech1", "Beech_small1", "Beech_small2", "Beech_Stub", "beech_log", "beech_log_half",
@@ -269,29 +240,31 @@ namespace TrollTamerMod
           "rock4_coast", "rock4_forest", "rock4_heath", "MineRock_Stone",
           "Rock_3", "Rock_4", "Rock_4_plains", "Rock_7", "BigRock", "rock_mistlands1" };
 
-        private static readonly HashSet<string> FallbackCopper = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        { "rock4_copper", "MineRock_Copper" };
-
         private static bool FallbackNameMatch(string prefab, GatherType type)
         {
+            if (string.IsNullOrEmpty(prefab)) return false;
+
             switch (type)
             {
-                case GatherType.Wood: return FallbackWood.Contains(prefab);
-                case GatherType.FineWood: return FallbackFine.Contains(prefab);
-                case GatherType.CoreWood: return FallbackCore.Contains(prefab);
-                case GatherType.Stone: return FallbackStone.Contains(prefab);
-                case GatherType.Copper: return FallbackCopper.Contains(prefab);
-                default: return false;
+                case GatherType.Wood:
+                    return FallbackWood.Contains(prefab);
+                case GatherType.FineWood:
+                    return FallbackFine.Contains(prefab);
+                case GatherType.CoreWood:
+                    return FallbackCore.Contains(prefab);
+                case GatherType.Stone:
+                    return FallbackStone.Contains(prefab) || prefab.IndexOf("rock", StringComparison.OrdinalIgnoreCase) >= 0;
+                case GatherType.Copper:
+                    // Находит и rock4_copper, и rock4_copper_frac, и MineRock_Copper
+                    return prefab.IndexOf("copper", StringComparison.OrdinalIgnoreCase) >= 0;
+                default:
+                    return false;
             }
         }
     }
 
     // ================================================================
-    //  КОНТРОЛЛЕР ДОБЫЧИ v2
-    //   - поиск: плотная маска + проверка пути + блэклист;
-    //   - дистанция: до РЕАЛЬНОЙ поверхности (рейкаст, не AABB!);
-    //   - удар: анимация всегда, урон контроллером, AOE-размах;
-    //   - ванильный двойной урон подавляется TrollGatherDamagePatches.
+    //  КОНТРОЛЛЕР ДОБЫЧИ
     // ================================================================
     public class TrollGatherController : MonoBehaviour
     {
@@ -316,6 +289,7 @@ namespace TrollTamerMod
         private float m_noSurfaceTime;
         private int m_searchFailCount;
         private int m_abandonCount;
+        private bool m_hitThisTarget;
 
         private float m_progressCheckTimer;
         private float m_lastSurfaceDist = float.MaxValue;
@@ -325,15 +299,15 @@ namespace TrollTamerMod
         private float m_lastLogTime = -30f;
 
         // ---------------------- настройки ----------------------
-        private const float SearchCooldown = 2f;      // пауза между поиском цели
-        private const float SearchRadius = 60f;       // радиус поиска
-        private const float AttackRange = 3.2f;       // до РЕАЛЬНОЙ поверхности цели
-        private const float AttackInterval = 1.4f;    // период взмахов
-        private const float AttackDamage = 140f;      // урон за взмах (дерево + кирка)
-        private const int AttackToolTier = 4;         // тир инструмента
-        private const float SwingPointInward = 0.3f;  // заглубление точки (зоны MineRock5)
-        private const float SweepRadius = 1.6f;       // AOE-размах вокруг точки удара
-        private const int MaxSweepTargets = 3;        // доп. целей за взмах
+        private const float SearchCooldown = 2f;
+        private const float SearchRadius = 60f;
+        private const float AttackRange = 3.2f;
+        private const float AttackInterval = 1.4f;
+        private const float AttackDamage = 140f;
+        private const int AttackToolTier = 4;
+        private const float SwingPointInward = 0.3f;
+        private const float SweepRadius = 1.6f;
+        private const int MaxSweepTargets = 3;
         private const float ProgressWindow = 6f;
         private const float ProgressMinGain = 1f;
         private const int MaxAbandons = 6;
@@ -343,19 +317,16 @@ namespace TrollTamerMod
         private const float FaceTimeout = 1.5f;
         private const float ChestHeight = 2.2f;
 
-        // ПЛОТНАЯ маска: только природные твёрдые слои (те же, по которым
-        // ходит pathfinding — BaseAI.m_solidRayMask). Куски построек,
-        // предметы, дым больше не забивают буфер — цели видны всегда.
+        // Единая маска поиска (включает piece и terrain)
         private static readonly int s_searchMask =
-            LayerMask.GetMask("Default", "static_solid", "Default_small");
-        private static readonly Collider[] s_overlap = new Collider[1024];
+            LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain");
+        private static readonly Collider[] s_overlap = new Collider[2048];
         private static readonly Collider[] s_sweep = new Collider[48];
 
         private static readonly MethodInfo s_moveTo = AccessTools.Method(typeof(BaseAI), "MoveTo");
         private static readonly MethodInfo s_lookAt = AccessTools.Method(typeof(BaseAI), "LookAt");
         private static readonly MethodInfo s_havePath = AccessTools.Method(typeof(BaseAI), "HavePath");
 
-        // флаг для патчей подавления двойного урона (см. TrollGatherDamagePatches)
         internal static bool IsApplyingDamage;
 
         internal bool IsAttackingTarget(GameObject go)
@@ -363,7 +334,6 @@ namespace TrollTamerMod
             return m_target != null && go != null && m_target.gameObject == go;
         }
 
-        // чёрный список недостижимых целей (как CompanionAI._targetBlacklist)
         private readonly List<Vector3> m_blackPos = new List<Vector3>();
         private readonly List<float> m_blackTime = new List<float>();
 
@@ -390,11 +360,9 @@ namespace TrollTamerMod
             if (type <= 0) { StopGather(); return; }
             m_type = (GatherType)type;
 
-            // бой важнее добычи (и существо, и статическая цель)
             if (m_ai != null && (m_ai.GetTargetCreature() != null || m_ai.GetStaticTarget() != null)) return;
             if (m_ai != null && m_ai.IsSleeping()) return;
 
-            // --- цель жива? ---
             bool targetAlive = m_target != null && m_target.gameObject.activeInHierarchy;
             if (!targetAlive)
             {
@@ -413,13 +381,11 @@ namespace TrollTamerMod
                 return;
             }
 
-            // --- реальная точка поверхности и дистанция ---
             bool haveSurface = ComputeSurfaceInfo(out Vector3 point, out float dist);
             m_surfacePoint = point;
 
             if (!haveSurface)
             {
-                // коллайдеры исчезли/цель выедена — бросаем через 5 с
                 m_noSurfaceTime += dt;
                 if (m_noSurfaceTime > 5f)
                 {
@@ -433,7 +399,6 @@ namespace TrollTamerMod
 
             if (!haveSurface || dist > AttackRange)
             {
-                // ФАЗА ПОДХОДА
                 m_attackTimer = 0f;
                 Vector3 moveTarget = haveSurface ? point : m_target.transform.position;
                 if (m_ai != null)
@@ -450,7 +415,6 @@ namespace TrollTamerMod
                 return;
             }
 
-            // ФАЗА УДАРА: сначала развернуться к цели
             Vector3 flat = point - transform.position;
             flat.y = 0f;
             if (flat.sqrMagnitude > 0.01f)
@@ -462,7 +426,7 @@ namespace TrollTamerMod
                     m_ai?.StopMoving();
                     try { s_lookAt?.Invoke(m_ai, new object[] { point }); } catch { }
                     m_faceTimer += dt;
-                    if (m_faceTimer < FaceTimeout) return; // ждём разворота
+                    if (m_faceTimer < FaceTimeout) return;
                 }
             }
             m_faceTimer = 0f;
@@ -478,13 +442,6 @@ namespace TrollTamerMod
             }
         }
 
-        // ============================================================
-        //  РЕАЛЬНАЯ ПОВЕРХНОСТЬ ЦЕЛИ (не AABB!)
-        //  Для не-выпуклых MeshCollider ClosestPoint невозможен, а bounds
-        //  врёт на метры — из-за этого тролль раньше «бил» с огромной
-        //  дистанции. Поверхность таких мешей берём рейкастом от груди
-        //  к центру меша; если закрыто чужим объектом — коллайдер пропускаем.
-        // ============================================================
         private bool ComputeSurfaceInfo(out Vector3 point, out float dist)
         {
             point = m_target.transform.position;
@@ -503,7 +460,7 @@ namespace TrollTamerMod
             for (int i = 0; i < m_targetCols.Length; i++)
             {
                 Collider c = m_targetCols[i];
-                if (c == null || !c.enabled) continue;
+                if (c == null || !c.enabled || !c.gameObject.activeInHierarchy) continue;
 
                 Vector3 p;
                 MeshCollider mc = c as MeshCollider;
@@ -514,7 +471,7 @@ namespace TrollTamerMod
                     RaycastHit rh;
                     if (!Physics.Raycast(from, to.normalized, out rh, to.magnitude + 0.5f,
                             s_searchMask, QueryTriggerInteraction.Collide)) continue;
-                    if (!rh.transform.IsChildOf(m_target.transform)) continue; // закрыто чужим
+                    if (!rh.transform.IsChildOf(m_target.transform)) continue;
                     p = rh.point;
                 }
                 else
@@ -529,9 +486,6 @@ namespace TrollTamerMod
             return any;
         }
 
-        // ============================================================
-        //  ПОИСК ЦЕЛИ: плотная маска + достижимость + блэклист
-        // ============================================================
         private void FindTarget(GatherType type)
         {
             CleanupBlacklist();
@@ -540,7 +494,7 @@ namespace TrollTamerMod
             int n = Physics.OverlapSphereNonAlloc(center, SearchRadius, s_overlap,
                 s_searchMask, QueryTriggerInteraction.Collide);
             if (n >= s_overlap.Length)
-                Debug.LogWarning("[TrollMenu] Gather scan: буфер переполнен, часть целей пропущена");
+                Debug.LogWarning("[TrollMenu] Gather scan: буфер переполнен (" + n + ")");
 
             MonoBehaviour best = null;
             float bestDist = float.MaxValue;
@@ -561,11 +515,22 @@ namespace TrollTamerMod
 
                 float dist = Utils.DistanceXZ(destr.transform.position, transform.position);
 
-                // достижимость: не хватаемся за цели без пути (за рекой/скалой)
-                if (dist > 6f && !HavePath(destr.transform.position))
+                // HavePath пропускаем для крупных жил (центр в глубине под землёй)
+                if (dist > 10f && !(destr is MineRock) && !(destr is MineRock5))
                 {
-                    unreachable++;
-                    continue;
+                    Vector3 checkPos = destr.transform.position;
+                    Vector3 toward = transform.position - checkPos;
+                    toward.y = 0f;
+                    if (toward.sqrMagnitude > 0.01f)
+                    {
+                        toward.Normalize();
+                        checkPos += toward * 2f;
+                    }
+                    if (!HavePath(checkPos))
+                    {
+                        unreachable++;
+                        continue;
+                    }
                 }
 
                 if (dist < bestDist) { bestDist = dist; best = destr; }
@@ -580,14 +545,15 @@ namespace TrollTamerMod
                 m_progressCheckTimer = 0f;
                 m_noProgressCount = 0;
                 m_searchFailCount = 0;
+                m_hitThisTarget = false;
                 ThrottledLog("Target: " + TrollResourceMatcher.GetRootPrefabName(best) +
                              " dist=" + bestDist.ToString("F0") +
-                             (unreachable > 0 ? " (недостижимых пропущено: " + unreachable + ")" : ""));
+                             (unreachable > 0 ? " (недостижимых: " + unreachable + ")" : ""));
             }
             else
             {
                 m_searchFailCount++;
-                m_searchCooldown = Mathf.Min(2f + m_searchFailCount, 8f); // пауза растёт
+                m_searchCooldown = Mathf.Min(2f + m_searchFailCount, 8f);
                 if (m_searchFailCount >= MaxSearchFails)
                 {
                     Notify("Рядом нет подходящих ресурсов");
@@ -608,22 +574,31 @@ namespace TrollTamerMod
             catch { return true; }
         }
 
-        // ============================================================
-        //  ПРОГРЕСС (только фаза подхода): блэклист вместо мгновенного стопа
-        // ============================================================
         private void TrackProgress(float dist, float dt)
         {
             m_progressCheckTimer += dt;
             if (m_progressCheckTimer < ProgressWindow) return;
             m_progressCheckTimer = 0f;
 
+            float velocity = m_character != null ? m_character.GetVelocity().magnitude : 0f;
+
             float gain = m_lastSurfaceDist - dist;
-            if (m_lastSurfaceDist != float.MaxValue && gain < ProgressMinGain)
+            if (m_lastSurfaceDist != float.MaxValue && gain < ProgressMinGain && velocity < 0.5f)
             {
                 m_noProgressCount++;
                 if (m_noProgressCount >= 2)
                 {
                     m_noProgressCount = 0;
+
+                    if ((m_target is MineRock || m_target is MineRock5) && m_hitThisTarget)
+                    {
+                        m_progressCheckTimer = 0f;
+                        m_lastSurfaceDist = float.MaxValue;
+                        m_targetCols = null;
+                        m_colsRefreshTimer = 0f;
+                        return;
+                    }
+
                     m_abandonCount++;
                     BlacklistPosition(m_target.transform.position);
                     m_target = null;
@@ -641,16 +616,11 @@ namespace TrollTamerMod
             m_lastSurfaceDist = dist;
         }
 
-        // ============================================================
-        //  УДАР: анимация всегда + урон контроллером + AOE-размах
-        // ============================================================
         private void PerformSwing()
         {
             MonoBehaviour mb = m_target;
             if (mb == null || !mb.gameObject.activeInHierarchy) return;
 
-            // визуал: настоящий взмах; безоружному троллю StartAttack может
-            // вернуть false — тогда дёргаем аниматор напрямую
             bool started = false;
             try { if (!m_character.InAttack()) started = m_character.StartAttack(null, false); }
             catch { }
@@ -659,13 +629,17 @@ namespace TrollTamerMod
                 try { m_zanim.SetTrigger("attack"); } catch { }
             }
 
-            // урон: основная цель по истинной точке поверхности
             ApplyDamage(mb, m_surfacePoint, m_hitDir);
-            // размах: соседние подходящие цели (как TryApplyTreeAoe/RockAoe)
             ApplySweep(mb, m_surfacePoint, m_hitDir);
+
+            m_hitThisTarget = true;
+            m_progressCheckTimer = 0f;
+            m_lastSurfaceDist = float.MaxValue;
+            m_noProgressCount = 0;
+            m_colsRefreshTimer = 0f;
         }
 
-        private void ApplyDamage(MonoBehaviour mb, Vector3 point, Vector3 dir)
+        private void ApplyDamage(MonoBehaviour mb, Vector3 point, Vector3 dir, Collider hitCollider = null)
         {
             if (mb == null || !mb.gameObject.activeInHierarchy) return;
             if (!(mb is IDestructible destr)) return;
@@ -673,16 +647,34 @@ namespace TrollTamerMod
             try
             {
                 HitData hit = new HitData();
-                hit.m_damage.m_damage = AttackDamage;    // деревья (TreeBase/TreeLog/Destructible)
-                hit.m_damage.m_pickaxe = AttackDamage;   // камни/руды (MineRock/MineRock5)
+                hit.m_damage.m_damage = AttackDamage;
+                hit.m_damage.m_pickaxe = AttackDamage;
                 hit.m_toolTier = AttackToolTier;
-                hit.m_point = point + dir * SwingPointInward + Vector3.up * 0.1f;
+
+                if (mb is MineRock || mb is MineRock5)
+                {
+                    hitCollider = FindZoneCollider(mb, point);
+                }
+
+                if (hitCollider != null)
+                {
+                    hit.m_hitCollider = hitCollider;
+                    hit.m_point = hitCollider.bounds.center;
+                }
+                else
+                {
+                    hit.m_point = point + dir * SwingPointInward + Vector3.up * 0.1f;
+                }
+
                 hit.m_dir = dir;
                 hit.m_hitType = HitData.HitType.EnemyHit;
 
                 TrollGatherController.IsApplyingDamage = true;
                 try { destr.Damage(hit); }
                 finally { TrollGatherController.IsApplyingDamage = false; }
+
+                Debug.Log($"[TrollMenu] Damage → '{mb.gameObject.name}' " +
+                          $"zone='{hitCollider?.name ?? "fallback"}'");
             }
             catch (Exception e)
             {
@@ -690,8 +682,34 @@ namespace TrollTamerMod
             }
         }
 
-        // «Размах» тролля: одним взмахом задеваем соседние цели того же типа
-        // (аналог TryApplyTreeAoe/TryApplyRockAoe из HarvestController Companions)
+        private Collider FindZoneCollider(MonoBehaviour target, Vector3 nearPoint)
+        {
+            if (m_targetCols == null || m_targetCols.Length == 0) return null;
+
+            m_colsRefreshTimer -= Time.deltaTime;
+            if (m_colsRefreshTimer <= 0f)
+            {
+                m_targetCols = target.GetComponentsInChildren<Collider>(true);
+                m_colsRefreshTimer = 3f;
+            }
+
+            Collider best = null;
+            float bestScore = float.MaxValue;
+
+            for (int i = 0; i < m_targetCols.Length; i++)
+            {
+                Collider c = m_targetCols[i];
+                if (c == null || !c.enabled || !c.gameObject.activeInHierarchy) continue;
+
+                float d = Vector3.Distance(c.bounds.center, nearPoint);
+                float size = c.bounds.size.magnitude;
+                float score = d + size * 0.5f;
+
+                if (score < bestScore) { bestScore = score; best = c; }
+            }
+            return best;
+        }
+
         private void ApplySweep(MonoBehaviour main, Vector3 point, Vector3 dir)
         {
             int n = Physics.OverlapSphereNonAlloc(point, SweepRadius, s_sweep,
@@ -704,7 +722,7 @@ namespace TrollTamerMod
             for (int i = 0; i < n && applied < MaxSweepTargets; i++)
             {
                 Collider c = s_sweep[i];
-                if (c == null || !c.enabled) continue;
+                if (c == null || !c.enabled || !c.gameObject.activeInHierarchy) continue;
 
                 MonoBehaviour destr = TrollResourceMatcher.FindDestructible(c);
                 if (destr == null) continue;
@@ -712,10 +730,10 @@ namespace TrollTamerMod
                 if (!TrollResourceMatcher.TargetMatches(destr, m_type)) continue;
                 if (!hitSet.Add(destr)) continue;
 
-                // для MineRock/MineRock5 точка должна попасть внутрь зоны
                 Vector3 p = (destr is MineRock || destr is MineRock5)
                     ? c.bounds.center
                     : SafeClosestPoint(c, point);
+
                 ApplyDamage(destr, p, dir);
                 applied++;
             }
@@ -732,9 +750,6 @@ namespace TrollTamerMod
             catch { return c.bounds.ClosestPoint(to); }
         }
 
-        // ============================================================
-        //  БЛЭКЛИСТ недостижимых/брошенных целей
-        // ============================================================
         private void BlacklistPosition(Vector3 p)
         {
             if (IsBlacklisted(p)) return;
@@ -787,8 +802,7 @@ namespace TrollTamerMod
         }
 
         // ============================================================
-        //  ПУБЛИЧНОЕ API (сигнатуры сохранены — совместимость с
-        //  BuildOnToll FIX 21, MenuPatches, TrollFriend)
+        //  ПУБЛИЧНОЕ API
         // ============================================================
         public static void Start(ZNetView trollNview, GatherType type)
         {
@@ -797,7 +811,6 @@ namespace TrollTamerMod
             ZDO zdo = trollNview.GetZDO();
             if (zdo == null) return;
 
-            // отмена маршрута
             zdo.Set(TrollBuildingMod.TrollWalkConstants.HashActive, false);
             TrollBuildingMod.TrollWalkManager.Instance?.CancelRoute(zdo.m_uid, false);
 
@@ -810,8 +823,8 @@ namespace TrollTamerMod
             }
 
             zdo.Set(HashGatherKey, (int)type);
+            TrollResourceMatcher.ClearCache();
 
-            // сброс следования (иначе ваниль тянула тролля к игроку)
             MonsterAI ai = trollNview.GetComponent<MonsterAI>();
             if (ai != null)
             {
@@ -834,6 +847,7 @@ namespace TrollTamerMod
             ctrl.m_lastSurfaceDist = float.MaxValue;
             ctrl.m_faceTimer = 0f;
             ctrl.m_noSurfaceTime = 0f;
+            ctrl.m_hitThisTarget = false;
             ctrl.m_blackPos.Clear();
 
             string[] names = { "", "древесину", "качественную древесину", "цельную древесину", "камень", "медь" };
@@ -984,9 +998,6 @@ namespace TrollTamerMod
             TrollMenuState.IsOpen = false;
         }
 
-        // ============================================================
-        //  ПОСТРОЕНИЕ UI
-        // ============================================================
         private void BuildUI()
         {
             GameObject root = new GameObject("Root");
@@ -1074,9 +1085,6 @@ namespace TrollTamerMod
             rt.offsetMin = rt.offsetMax = Vector2.zero;
         }
 
-        // ============================================================
-        //  ПУНКТЫ
-        // ============================================================
         private void BuildItems()
         {
             AddItem("Freeze", 90f, false, null,
@@ -1165,9 +1173,6 @@ namespace TrollTamerMod
             m_allItems.Add(item);
         }
 
-        // ============================================================
-        //  ЛОГИКА
-        // ============================================================
         private void Update()
         {
             if (!m_active) return;
@@ -1319,9 +1324,6 @@ namespace TrollTamerMod
             if (m_descText != null) m_descText.text = desc;
         }
 
-        // ============================================================
-        //  ДЕЙСТВИЯ
-        // ============================================================
         private void OnFreeze()
         {
             ZNetView nv = FindTrollNView();
@@ -1356,9 +1358,6 @@ namespace TrollTamerMod
             return go != null ? go.GetComponent<ZNetView>() : null;
         }
 
-        // ============================================================
-        //  ПРОЦЕДУРНЫЕ СПРАЙТЫ
-        // ============================================================
         private static Sprite CircleSprite
         {
             get
@@ -1459,9 +1458,6 @@ namespace TrollTamerMod
             return Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), size);
         }
 
-        // ============================================================
-        //  ИКОНКИ — EMBEDDED RESOURCE (по суффиксу имени)
-        // ============================================================
         private static Sprite LoadEmbeddedIcon(params string[] fileNames)
         {
             try
@@ -1540,7 +1536,6 @@ namespace TrollTamerMod
     [HarmonyPatch]
     public static class MenuPatches
     {
-        // Y открывает меню вместо прямого старта маршрута
         [HarmonyPatch(typeof(TrollBuildingMod.TrollWalkRouteSession), "Begin")]
         [HarmonyPrefix]
         private static bool RouteBegin_Prefix(ZDOID troll)
@@ -1551,7 +1546,6 @@ namespace TrollTamerMod
             return false;
         }
 
-        // Игровой ввод заблокирован, пока меню открыто
         [HarmonyPatch(typeof(Player), "TakeInput")]
         [HarmonyPrefix]
         [HarmonyPriority(Priority.VeryHigh)]
@@ -1561,7 +1555,6 @@ namespace TrollTamerMod
             return true;
         }
 
-        // Курсор свободен, пока меню открыто
         [HarmonyPatch(typeof(GameCamera), "UpdateMouseCapture")]
         [HarmonyPrefix]
         [HarmonyPriority(Priority.VeryHigh)]
@@ -1573,7 +1566,6 @@ namespace TrollTamerMod
             return false;
         }
 
-        // Обзор заморожен (мышь)
         [HarmonyPatch(typeof(ZInput), "GetMouseDelta")]
         [HarmonyPrefix]
         private static bool ZInput_GetMouseDelta_Prefix(ref Vector2 __result)
@@ -1582,7 +1574,6 @@ namespace TrollTamerMod
             return true;
         }
 
-        // Обзор заморожен (геймпад)
         [HarmonyPatch(typeof(ZInput), "GetJoyRightStick")]
         [HarmonyPrefix]
         private static bool ZInput_GetJoyRightStick_Prefix(ref Vector2 __result)
@@ -1591,7 +1582,6 @@ namespace TrollTamerMod
             return true;
         }
 
-        // Камера (включая скролл-зум) заморожена, пока меню открыто
         [HarmonyPatch(typeof(GameCamera), "UpdateCamera")]
         [HarmonyPrefix]
         private static bool GameCamera_UpdateCamera_Prefix()
@@ -1599,7 +1589,6 @@ namespace TrollTamerMod
             return !TrollMenuState.IsOpen;
         }
 
-        // Следование за игроком отключено во время добычи
         [HarmonyPatch(typeof(BaseAI), "Follow")]
         [HarmonyPrefix]
         private static bool BaseAI_Follow_Prefix(BaseAI __instance)
@@ -1615,7 +1604,6 @@ namespace TrollTamerMod
             return true;
         }
 
-        // Ванильная команда (следовать/стоять) отменяет работу
         [HarmonyPatch(typeof(Tameable), "RPC_Command")]
         [HarmonyPostfix]
         private static void Tameable_RPC_Command_Postfix(Tameable __instance)
@@ -1629,7 +1617,6 @@ namespace TrollTamerMod
             catch (Exception e) { Debug.LogWarning("[TrollMenu] Command cancel: " + e.Message); }
         }
 
-        // Idle-движение отключено во время добычи
         [HarmonyPatch(typeof(BaseAI), "IdleMovement")]
         [HarmonyPrefix]
         [HarmonyPriority(Priority.High)]
@@ -1646,7 +1633,6 @@ namespace TrollTamerMod
             return true;
         }
 
-        // Контроллер маршрута отключён во время добычи
         [HarmonyPatch(typeof(TrollBuildingMod.TrollWalkController), "TickAI")]
         [HarmonyPrefix]
         private static bool WalkController_TickAI_Prefix(TrollBuildingMod.TrollWalkController __instance)
@@ -1658,7 +1644,6 @@ namespace TrollTamerMod
             return true;
         }
 
-        // Восстановление добычи после перезахода
         [HarmonyPatch(typeof(Character), "Awake")]
         [HarmonyPostfix]
         [HarmonyPriority(Priority.Low)]
@@ -1679,19 +1664,14 @@ namespace TrollTamerMod
     }
 
     // ================================================================
-    //  ПАТЧИ ДОБЫЧИ v2: ванильный физический удар кулаков по ТЕКУЩЕЙ цели
-    //  добычи подавляется — урон авторитетен только от контроллера.
-    //  Зеркало схемы Companions.CombatPatches «SuppressHarvestPhysical»:
-    //  там ровно так же гасятся Destructible/MineRock/MineRock5/TreeBase/
-    //  TreeLog.Damage, если бьёт сборщик по своей цели, а урон идёт из
-    //  TryApplyTreeAoe/TryApplyRockAoe с флагом IsApplyingAoeDamage.
+    //  ПАТЧИ ПОДАВЛЕНИЯ ДВОЙНОГО УРОНА
     // ================================================================
     [HarmonyPatch]
     public static class TrollGatherDamagePatches
     {
         internal static bool ShouldSuppress(MonoBehaviour destructible, HitData hit)
         {
-            if (TrollGatherController.IsApplyingDamage) return false; // урон контроллера — проходит
+            if (TrollGatherController.IsApplyingDamage) return false;
             if (hit == null || destructible == null) return false;
             Character attacker = hit.GetAttacker();
             if (attacker == null) return false;
@@ -1721,8 +1701,6 @@ namespace TrollTamerMod
             => !ShouldSuppress(__instance, hit);
     }
 
-    // TreeLog берём рефлексией (в остальном моде этот тип тоже не
-    // referenced напрямую — не привязываемся к нему и тут)
     [HarmonyPatch]
     public static class TrollGatherTreeLogDamagePatch
     {
