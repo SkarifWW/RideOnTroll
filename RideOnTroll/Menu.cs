@@ -8,27 +8,33 @@ using UnityEngine;
 using UnityEngine.UI;
 
 // ============================================================================
-//  MENU.CS v8 — Радиальное меню (в стиле ванильного) + добыча ресурсов.
+//  MENU.CS v9 — Радиальное меню (в стиле ванильного) + добыча ресурсов v2.
 //
 //  Y на тролле — открыть. Верх: Не двигаться | Лево: Лес | Право: Камень | Низ: Маршрут
 //  Наведение на Лес/Камень (0.15с) раскрывает подпункты. ЛКМ — выбор.
 //  ПКМ / Y / Esc — закрыть. Иконки — Embedded Resources.
 //
-//  ДОБЫЧА:
-//   - цель подбирается ПО ТАБЛИЦЕ ДРОПА (все DropOnDestroyed + собственные
-//     таблицы компонента, БЕЗ break);
-//   - урон ЧЕРЕЗ СТАНДАРТНЫЙ IDestructible.Damage(HitData):
-//       * деревья  — общий m_damage;
-//       * камни/руды — урон КИРКИ (m_pickaxe) + toolTier 4 (иначе урон 0);
-//       * hit.m_point = ближайшая точка поверхности + 0.3м внутрь —
-//         игра САМА выбирает зону удара MineRock5 по координате;
-//   - дистанция/точка — до ПОВЕРХНОСТИ коллайдера;
-//   - прогресс-контроль ТОЛЬКО в фазе подхода;
-//   - урон по таймеру, StartAttack — только визуал;
-//   - старт сбрасывает следование (+ патч BaseAI.Follow);
-//   - поворот к цели в фазе удара;
-//   - поиск только при отсутствии цели (кулдаун 3с);
-//   - ванильная команда отменяет работу.
+//  ДОБЫЧА v2 (полная переработка алгоритма):
+//   - ПОИСК: плотная маска слоёв (Default/static_solid/Default_small — только
+//     природные твёрдые объекты, те же слои что видит pathfinding), буфер 1024;
+//     куски построек / предметы / дым больше не забивают буфер — деревья и
+//     камни видны всегда. Проверка достижимости (BaseAI.HavePath) + блэклист
+//     недостижимых целей на 60 с (как CompanionAI в моде Companions).
+//   - ДИСТАНЦИЯ: до РЕАЛЬНОЙ поверхности цели, не до AABB! Для не-выпуклых
+//     MeshCollider (все валуны, MineRock/MineRock5) поверхность берётся
+//     рейкастом от груди к центру меша — раньше AABB врал на метры, и тролль
+//     «бил» с огромной дистанции. AttackRange 3.2 — только вплотную.
+//   - УДАР: анимация всегда (StartAttack, фоллбэк zanim "attack" — безоружному
+//     троллю StartAttack возвращает false). Урон — контроллером, по истинной
+//     точке поверхности (+0.3 м внутрь для зон MineRock5). AOE-размах по
+//     соседним целям того же типа (аналог TryApplyTreeAoe/TryApplyRockAoe
+//     из HarvestController мода Companions).
+//   - ДВОЙНОЙ УРОН: ванильный физический удар кулаков по текущей цели добычи
+//     подавляется патчами TrollGatherDamagePatches (зеркало схемы
+//     Companions.CombatPatches «SuppressHarvestPhysical») — урон контроллера
+//     авторитетен, нет спама «Too Hard» от тир-0 кулаков.
+//   - КЛАССИФИКАЦИЯ: дроп-таблицы + имена префабов + фоллбэк по резистам
+//     Destructible.m_damages (как Companions.GetHarvestable).
 // ============================================================================
 namespace TrollTamerMod
 {
@@ -50,7 +56,7 @@ namespace TrollTamerMod
     }
 
     // ================================================================
-    //  ПОДБОР ЦЕЛЕЙ ПО ТАБЛИЦЕ ДРОПА
+    //  ПОДБОР ЦЕЛЕЙ ПО ТАБЛИЦЕ ДРОПА + ФОЛЛБЭКИ
     // ================================================================
     internal static class TrollResourceMatcher
     {
@@ -145,7 +151,8 @@ namespace TrollTamerMod
                         return true;
                 return false;
             }
-            return FallbackNameMatch(prefab, type);
+            if (FallbackNameMatch(prefab, type)) return true;
+            return FallbackByDamageType(destr, type);   // НОВОЕ: по резистам
         }
 
         // ВСЕ таблицы дропа со ВСЕЙ иерархии, БЕЗ break.
@@ -218,6 +225,29 @@ namespace TrollTamerMod
             }
         }
 
+        // НОВОЕ: «модификатор урона работает?» (не Immune/Ignore)
+        private static bool WorksOn(HitData.DamageModifier m)
+        {
+            return m != HitData.DamageModifier.Immune && m != HitData.DamageModifier.Ignore;
+        }
+
+        // НОВОЕ: классификация по резистам Destructible.m_damages
+        // (та же логика, что в Companions.GetHarvestable) — ловит стволы/пни/
+        // камни, которых нет ни в дроп-таблице, ни в списках имён
+        private static bool FallbackByDamageType(MonoBehaviour destr, GatherType type)
+        {
+            Destructible d = destr as Destructible;
+            if (d == null) return false;
+            bool chop = WorksOn(d.m_damages.m_chop);
+            bool pick = WorksOn(d.m_damages.m_pickaxe);
+            switch (type)
+            {
+                case GatherType.Wood: return chop;          // любой рубимый ствол/пень
+                case GatherType.Stone: return pick && !chop; // только кирко-чувствительное
+                default: return false;  // FineWood/CoreWood/Copper — только дроп/имя
+            }
+        }
+
         // фоллбэк по точным именам (если дроп не читается)
 
         private static readonly HashSet<string> FallbackWood = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -257,13 +287,18 @@ namespace TrollTamerMod
     }
 
     // ================================================================
-    //  КОНТРОЛЛЕР ДОБЫЧИ
+    //  КОНТРОЛЛЕР ДОБЫЧИ v2
+    //   - поиск: плотная маска + проверка пути + блэклист;
+    //   - дистанция: до РЕАЛЬНОЙ поверхности (рейкаст, не AABB!);
+    //   - удар: анимация всегда, урон контроллером, AOE-размах;
+    //   - ванильный двойной урон подавляется TrollGatherDamagePatches.
     // ================================================================
     public class TrollGatherController : MonoBehaviour
     {
         private Character m_character;
         private ZNetView m_nview;
         private MonsterAI m_ai;
+        private ZSyncAnimation m_zanim;
 
         public const string ZDO_GATHER_KEY = "TrollGather_Type";
         public static readonly int HashGatherKey = ZDO_GATHER_KEY.GetStableHashCode();
@@ -271,41 +306,73 @@ namespace TrollTamerMod
         private MonoBehaviour m_target;
         private Collider[] m_targetCols;
         private Vector3 m_surfacePoint;
+        private Vector3 m_hitDir = Vector3.forward;
+        private GatherType m_type;
 
         private float m_searchCooldown;
         private float m_attackTimer;
+        private float m_faceTimer;
+        private float m_colsRefreshTimer;
+        private float m_noSurfaceTime;
         private int m_searchFailCount;
+        private int m_abandonCount;
 
-        // контроль прогресса (только фаза подхода)
         private float m_progressCheckTimer;
         private float m_lastSurfaceDist = float.MaxValue;
         private int m_noProgressCount;
-        private int m_abandonCount;
+
         private float m_lastMsgTime = -30f;
+        private float m_lastLogTime = -30f;
 
-        private const float SearchCooldown = 3f;
-        private const float SearchRadius = 80f;
-        private const float AttackRange = 4.5f;       // до ПОВЕРХНОСТИ цели
-        private const float AttackInterval = 1.5f;
-        private const float AttackDamage = 250f;
-        private const int AttackToolTier = 4;
-        private const int MaxSearchFails = 3;
-        private const int MaxAbandons = 3;
+        // ---------------------- настройки ----------------------
+        private const float SearchCooldown = 2f;      // пауза между поиском цели
+        private const float SearchRadius = 60f;       // радиус поиска
+        private const float AttackRange = 3.2f;       // до РЕАЛЬНОЙ поверхности цели
+        private const float AttackInterval = 1.4f;    // период взмахов
+        private const float AttackDamage = 140f;      // урон за взмах (дерево + кирка)
+        private const int AttackToolTier = 4;         // тир инструмента
+        private const float SwingPointInward = 0.3f;  // заглубление точки (зоны MineRock5)
+        private const float SweepRadius = 1.6f;       // AOE-размах вокруг точки удара
+        private const int MaxSweepTargets = 3;        // доп. целей за взмах
         private const float ProgressWindow = 6f;
-        private const float ProgressMinGain = 1.5f;
+        private const float ProgressMinGain = 1f;
+        private const int MaxAbandons = 6;
+        private const int MaxSearchFails = 8;
+        private const float BlacklistTime = 60f;
+        private const float BlacklistRadius = 4f;
+        private const float FaceTimeout = 1.5f;
+        private const float ChestHeight = 2.2f;
 
-        // всё кроме террейна/воды/персонажей; триггеры сканируем (зоны MineRock5)
-        private static readonly int s_searchMask = ~LayerMask.GetMask(
-            "terrain", "Water", "character", "character_net", "character_ghost", "hitbox", "vehicle");
-        private static readonly Collider[] s_overlap = new Collider[512];
+        // ПЛОТНАЯ маска: только природные твёрдые слои (те же, по которым
+        // ходит pathfinding — BaseAI.m_solidRayMask). Куски построек,
+        // предметы, дым больше не забивают буфер — цели видны всегда.
+        private static readonly int s_searchMask =
+            LayerMask.GetMask("Default", "static_solid", "Default_small");
+        private static readonly Collider[] s_overlap = new Collider[1024];
+        private static readonly Collider[] s_sweep = new Collider[48];
+
         private static readonly MethodInfo s_moveTo = AccessTools.Method(typeof(BaseAI), "MoveTo");
         private static readonly MethodInfo s_lookAt = AccessTools.Method(typeof(BaseAI), "LookAt");
+        private static readonly MethodInfo s_havePath = AccessTools.Method(typeof(BaseAI), "HavePath");
+
+        // флаг для патчей подавления двойного урона (см. TrollGatherDamagePatches)
+        internal static bool IsApplyingDamage;
+
+        internal bool IsAttackingTarget(GameObject go)
+        {
+            return m_target != null && go != null && m_target.gameObject == go;
+        }
+
+        // чёрный список недостижимых целей (как CompanionAI._targetBlacklist)
+        private readonly List<Vector3> m_blackPos = new List<Vector3>();
+        private readonly List<float> m_blackTime = new List<float>();
 
         private void Awake()
         {
             m_character = GetComponent<Character>();
             m_nview = GetComponent<ZNetView>();
             m_ai = GetComponent<MonsterAI>();
+            m_zanim = GetComponent<ZSyncAnimation>();
         }
 
         private void Update()
@@ -318,10 +385,14 @@ namespace TrollTamerMod
         {
             if (m_nview == null || !m_nview.IsValid() || !m_nview.IsOwner()) return;
             if (m_character == null || m_character.IsDead()) { StopGather(); return; }
-            if (m_ai != null && m_ai.GetTargetCreature() != null) return; // бой важнее
 
             int type = m_nview.GetZDO().GetInt(HashGatherKey, 0);
             if (type <= 0) { StopGather(); return; }
+            m_type = (GatherType)type;
+
+            // бой важнее добычи (и существо, и статическая цель)
+            if (m_ai != null && (m_ai.GetTargetCreature() != null || m_ai.GetStaticTarget() != null)) return;
+            if (m_ai != null && m_ai.IsSleeping()) return;
 
             // --- цель жива? ---
             bool targetAlive = m_target != null && m_target.gameObject.activeInHierarchy;
@@ -329,109 +400,152 @@ namespace TrollTamerMod
             {
                 m_target = null;
                 m_targetCols = null;
+                m_lastSurfaceDist = float.MaxValue;
 
-                if (m_searchCooldown > 0)
+                if (m_searchCooldown > 0f)
                 {
                     m_searchCooldown -= dt;
                     m_ai?.StopMoving();
                     return;
                 }
                 m_searchCooldown = SearchCooldown;
-                FindTarget((GatherType)type);
+                FindTarget(m_type);
                 return;
             }
 
-            // --- точка поверхности цели ---
-            m_surfacePoint = ClosestSurfacePoint(transform.position);
-            float dist = Utils.DistanceXZ(m_surfacePoint, transform.position);
+            // --- реальная точка поверхности и дистанция ---
+            bool haveSurface = ComputeSurfaceInfo(out Vector3 point, out float dist);
+            m_surfacePoint = point;
 
-            if (dist > AttackRange)
+            if (!haveSurface)
+            {
+                // коллайдеры исчезли/цель выедена — бросаем через 5 с
+                m_noSurfaceTime += dt;
+                if (m_noSurfaceTime > 5f)
+                {
+                    m_target = null;
+                    m_targetCols = null;
+                    m_searchCooldown = 0f;
+                    return;
+                }
+            }
+            else m_noSurfaceTime = 0f;
+
+            if (!haveSurface || dist > AttackRange)
             {
                 // ФАЗА ПОДХОДА
+                m_attackTimer = 0f;
+                Vector3 moveTarget = haveSurface ? point : m_target.transform.position;
                 if (m_ai != null)
                 {
-                    bool run = dist > 15f;
-                    try { s_moveTo?.Invoke(m_ai, new object[] { dt, m_surfacePoint, 1.5f, run }); }
+                    bool run = Utils.DistanceXZ(moveTarget, transform.position) > 15f;
+                    try { s_moveTo?.Invoke(m_ai, new object[] { dt, moveTarget, 0.8f, run }); }
                     catch
                     {
-                        Vector3 dir = m_surfacePoint - transform.position;
-                        dir.y = 0;
+                        Vector3 dir = moveTarget - transform.position; dir.y = 0f;
                         if (dir.sqrMagnitude > 0.01f) m_ai.MoveTowards(dir.normalized, run);
                     }
                 }
-                TrackProgress(dist, dt); // прогресс — ТОЛЬКО в подходе
+                if (haveSurface) TrackProgress(dist, dt);
+                return;
             }
-            else
+
+            // ФАЗА УДАРА: сначала развернуться к цели
+            Vector3 flat = point - transform.position;
+            flat.y = 0f;
+            if (flat.sqrMagnitude > 0.01f)
             {
-                // ФАЗА УДАРА: стоим, поворачиваемся, бьём
-                m_ai?.StopMoving();
-
-                try { s_lookAt?.Invoke(m_ai, new object[] { m_surfacePoint }); }
-                catch { }
-
-                m_attackTimer += dt;
-                if (m_attackTimer >= AttackInterval)
+                flat.Normalize();
+                m_hitDir = flat;
+                if (Vector3.Dot(transform.forward, flat) < 0.35f)
                 {
-                    m_attackTimer = 0;
-                    PerformSwing();
+                    m_ai?.StopMoving();
+                    try { s_lookAt?.Invoke(m_ai, new object[] { point }); } catch { }
+                    m_faceTimer += dt;
+                    if (m_faceTimer < FaceTimeout) return; // ждём разворота
                 }
             }
-        }
+            m_faceTimer = 0f;
 
-        // Урон НЕ зависит от StartAttack (безоружному троллю он вернёт false)
-        private void PerformSwing()
-        {
-            try { if (!m_character.InAttack()) m_character.StartAttack(null, false); }
-            catch { }
-            ApplyDamage();
-        }
+            m_ai?.StopMoving();
+            try { s_lookAt?.Invoke(m_ai, new object[] { point }); } catch { }
 
-        // ============================================================
-        //  УРОН — СТАНДАРТНЫЙ ПУТЬ ИГРЫ (IDestructible.Damage)
-        // ============================================================
-        private void ApplyDamage()
-        {
-            MonoBehaviour mb = m_target;
-            if (mb == null || !mb.gameObject.activeInHierarchy) return;
-            if (!(mb is IDestructible destr)) return;
-
-            try
+            m_attackTimer += dt;
+            if (m_attackTimer >= AttackInterval)
             {
-                // вектор от тролля к точке поверхности — направление удара
-                Vector3 hitDir = m_surfacePoint - transform.position;
-                hitDir.y = 0f;
-                if (hitDir.sqrMagnitude < 0.01f) hitDir = transform.forward;
-                else hitDir.Normalize();
-
-                // точка удара: поверхность + лёгкое «продавливание» внутрь,
-                // чтобы гарантированно попасть в зону MineRock5 (как кирка)
-                Vector3 hitPoint = m_surfacePoint + hitDir * 0.3f + Vector3.up * 0.2f;
-
-                HitData hit = new HitData();
-                hit.m_damage.m_damage = AttackDamage;   // общий (деревья)
-                hit.m_damage.m_pickaxe = AttackDamage;   // урон КИРКИ (камни/руды)
-                hit.m_toolTier = AttackToolTier;
-                hit.m_point = hitPoint;
-                hit.m_dir = hitDir;
-                hit.m_hitType = HitData.HitType.EnemyHit;
-                destr.Damage(hit);
-
-                Debug.Log("[TrollMenu] Damage -> " + TrollResourceMatcher.GetRootPrefabName(mb));
+                m_attackTimer = 0f;
+                PerformSwing();
             }
-            catch (Exception e) { Debug.LogWarning("[TrollMenu] Attack failed: " + e.Message); }
         }
 
         // ============================================================
-        //  ПОИСК ЦЕЛИ (только при её отсутствии)
+        //  РЕАЛЬНАЯ ПОВЕРХНОСТЬ ЦЕЛИ (не AABB!)
+        //  Для не-выпуклых MeshCollider ClosestPoint невозможен, а bounds
+        //  врёт на метры — из-за этого тролль раньше «бил» с огромной
+        //  дистанции. Поверхность таких мешей берём рейкастом от груди
+        //  к центру меша; если закрыто чужим объектом — коллайдер пропускаем.
+        // ============================================================
+        private bool ComputeSurfaceInfo(out Vector3 point, out float dist)
+        {
+            point = m_target.transform.position;
+            dist = float.MaxValue;
+
+            m_colsRefreshTimer -= Time.deltaTime;
+            if (m_targetCols == null || m_targetCols.Length == 0 || m_colsRefreshTimer <= 0f)
+            {
+                m_targetCols = m_target.GetComponentsInChildren<Collider>(true);
+                m_colsRefreshTimer = 3f;
+            }
+
+            Vector3 from = transform.position + Vector3.up * ChestHeight;
+            bool any = false;
+
+            for (int i = 0; i < m_targetCols.Length; i++)
+            {
+                Collider c = m_targetCols[i];
+                if (c == null || !c.enabled) continue;
+
+                Vector3 p;
+                MeshCollider mc = c as MeshCollider;
+                if (mc != null && !mc.convex)
+                {
+                    Vector3 to = mc.bounds.center - from;
+                    if (to.sqrMagnitude < 0.04f) continue;
+                    RaycastHit rh;
+                    if (!Physics.Raycast(from, to.normalized, out rh, to.magnitude + 0.5f,
+                            s_searchMask, QueryTriggerInteraction.Collide)) continue;
+                    if (!rh.transform.IsChildOf(m_target.transform)) continue; // закрыто чужим
+                    p = rh.point;
+                }
+                else
+                {
+                    try { p = c.ClosestPoint(from); }
+                    catch { p = c.bounds.ClosestPoint(from); }
+                }
+
+                float d = Vector3.Distance(p, from);
+                if (d < dist) { dist = d; point = p; any = true; }
+            }
+            return any;
+        }
+
+        // ============================================================
+        //  ПОИСК ЦЕЛИ: плотная маска + достижимость + блэклист
         // ============================================================
         private void FindTarget(GatherType type)
         {
+            CleanupBlacklist();
+
             Vector3 center = transform.position + Vector3.up * 2f;
-            int n = Physics.OverlapSphereNonAlloc(center, SearchRadius, s_overlap, s_searchMask);
+            int n = Physics.OverlapSphereNonAlloc(center, SearchRadius, s_overlap,
+                s_searchMask, QueryTriggerInteraction.Collide);
+            if (n >= s_overlap.Length)
+                Debug.LogWarning("[TrollMenu] Gather scan: буфер переполнен, часть целей пропущена");
 
             MonoBehaviour best = null;
             float bestDist = float.MaxValue;
             HashSet<UnityEngine.Object> seen = new HashSet<UnityEngine.Object>();
+            int unreachable = 0;
 
             for (int i = 0; i < n; i++)
             {
@@ -443,26 +557,37 @@ namespace TrollTamerMod
                 if (!seen.Add(destr)) continue;
                 if (destr.transform.IsChildOf(transform)) continue;
                 if (!TrollResourceMatcher.TargetMatches(destr, type)) continue;
+                if (IsBlacklisted(destr.transform.position)) continue;
 
                 float dist = Utils.DistanceXZ(destr.transform.position, transform.position);
+
+                // достижимость: не хватаемся за цели без пути (за рекой/скалой)
+                if (dist > 6f && !HavePath(destr.transform.position))
+                {
+                    unreachable++;
+                    continue;
+                }
+
                 if (dist < bestDist) { bestDist = dist; best = destr; }
             }
 
             if (best != null)
             {
                 m_target = best;
-                m_targetCols = best.GetComponentsInChildren<Collider>(true);
+                m_targetCols = null;
+                m_colsRefreshTimer = 0f;
                 m_lastSurfaceDist = float.MaxValue;
-                m_progressCheckTimer = 0;
+                m_progressCheckTimer = 0f;
                 m_noProgressCount = 0;
                 m_searchFailCount = 0;
-                m_abandonCount = 0;
-                Debug.Log("[TrollMenu] Target: " + TrollResourceMatcher.GetRootPrefabName(best) +
-                          " dist=" + bestDist.ToString("F0"));
+                ThrottledLog("Target: " + TrollResourceMatcher.GetRootPrefabName(best) +
+                             " dist=" + bestDist.ToString("F0") +
+                             (unreachable > 0 ? " (недостижимых пропущено: " + unreachable + ")" : ""));
             }
             else
             {
                 m_searchFailCount++;
+                m_searchCooldown = Mathf.Min(2f + m_searchFailCount, 8f); // пауза растёт
                 if (m_searchFailCount >= MaxSearchFails)
                 {
                     Notify("Рядом нет подходящих ресурсов");
@@ -471,68 +596,169 @@ namespace TrollTamerMod
             }
         }
 
-        // ============================================================
-        //  ТОЧКА ПОВЕРХНОСТИ ЦЕЛИ
-        // ============================================================
-        private Vector3 ClosestSurfacePoint(Vector3 from)
+        private bool HavePath(Vector3 pos)
         {
-            if (m_target == null) return transform.position;
-            if (m_targetCols == null || m_targetCols.Length == 0)
-                m_targetCols = m_target.GetComponentsInChildren<Collider>(true);
-
-            Vector3 best = m_target.transform.position;
-            float bestSqr = float.MaxValue;
-
-            foreach (Collider c in m_targetCols)
+            if (m_ai == null || s_havePath == null) return true;
+            try
             {
-                if (c == null || !c.enabled) continue;
-                Vector3 p;
-                try
-                {
-                    MeshCollider mc = c as MeshCollider;
-                    p = (mc != null && !mc.convex) ? c.bounds.ClosestPoint(from) : c.ClosestPoint(from);
-                }
-                catch { p = c.bounds.ClosestPoint(from); }
-
-                float d2 = (p - from).sqrMagnitude;
-                if (d2 < bestSqr) { bestSqr = d2; best = p; }
+                object r = s_havePath.Invoke(m_ai, new object[] { pos });
+                if (r == null) return true;
+                return (bool)r;
             }
-            return best;
+            catch { return true; }
         }
 
         // ============================================================
-        //  ПРОГРЕСС (только в фазе ПОДХОДА)
+        //  ПРОГРЕСС (только фаза подхода): блэклист вместо мгновенного стопа
         // ============================================================
         private void TrackProgress(float dist, float dt)
         {
             m_progressCheckTimer += dt;
             if (m_progressCheckTimer < ProgressWindow) return;
+            m_progressCheckTimer = 0f;
 
-            m_progressCheckTimer = 0;
             float gain = m_lastSurfaceDist - dist;
-
-            if (gain < ProgressMinGain)
+            if (m_lastSurfaceDist != float.MaxValue && gain < ProgressMinGain)
             {
                 m_noProgressCount++;
                 if (m_noProgressCount >= 2)
                 {
                     m_noProgressCount = 0;
                     m_abandonCount++;
+                    BlacklistPosition(m_target.transform.position);
                     m_target = null;
                     m_targetCols = null;
-                    m_searchCooldown = 0;
+                    m_searchCooldown = 0f;
 
                     if (m_abandonCount >= MaxAbandons)
                     {
-                        m_abandonCount = 0;
                         Notify("Тролль не может добраться до ресурсов");
                         StopGather();
                     }
                 }
             }
-            else { m_noProgressCount = 0; m_abandonCount = 0; }
-
+            else { m_noProgressCount = 0; }
             m_lastSurfaceDist = dist;
+        }
+
+        // ============================================================
+        //  УДАР: анимация всегда + урон контроллером + AOE-размах
+        // ============================================================
+        private void PerformSwing()
+        {
+            MonoBehaviour mb = m_target;
+            if (mb == null || !mb.gameObject.activeInHierarchy) return;
+
+            // визуал: настоящий взмах; безоружному троллю StartAttack может
+            // вернуть false — тогда дёргаем аниматор напрямую
+            bool started = false;
+            try { if (!m_character.InAttack()) started = m_character.StartAttack(null, false); }
+            catch { }
+            if (!started && !m_character.InAttack() && m_zanim != null)
+            {
+                try { m_zanim.SetTrigger("attack"); } catch { }
+            }
+
+            // урон: основная цель по истинной точке поверхности
+            ApplyDamage(mb, m_surfacePoint, m_hitDir);
+            // размах: соседние подходящие цели (как TryApplyTreeAoe/RockAoe)
+            ApplySweep(mb, m_surfacePoint, m_hitDir);
+        }
+
+        private void ApplyDamage(MonoBehaviour mb, Vector3 point, Vector3 dir)
+        {
+            if (mb == null || !mb.gameObject.activeInHierarchy) return;
+            if (!(mb is IDestructible destr)) return;
+
+            try
+            {
+                HitData hit = new HitData();
+                hit.m_damage.m_damage = AttackDamage;    // деревья (TreeBase/TreeLog/Destructible)
+                hit.m_damage.m_pickaxe = AttackDamage;   // камни/руды (MineRock/MineRock5)
+                hit.m_toolTier = AttackToolTier;
+                hit.m_point = point + dir * SwingPointInward + Vector3.up * 0.1f;
+                hit.m_dir = dir;
+                hit.m_hitType = HitData.HitType.EnemyHit;
+
+                TrollGatherController.IsApplyingDamage = true;
+                try { destr.Damage(hit); }
+                finally { TrollGatherController.IsApplyingDamage = false; }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[TrollMenu] Attack failed: " + e.Message);
+            }
+        }
+
+        // «Размах» тролля: одним взмахом задеваем соседние цели того же типа
+        // (аналог TryApplyTreeAoe/TryApplyRockAoe из HarvestController Companions)
+        private void ApplySweep(MonoBehaviour main, Vector3 point, Vector3 dir)
+        {
+            int n = Physics.OverlapSphereNonAlloc(point, SweepRadius, s_sweep,
+                s_searchMask, QueryTriggerInteraction.Collide);
+            if (n <= 0) return;
+
+            HashSet<MonoBehaviour> hitSet = new HashSet<MonoBehaviour> { main };
+            int applied = 0;
+
+            for (int i = 0; i < n && applied < MaxSweepTargets; i++)
+            {
+                Collider c = s_sweep[i];
+                if (c == null || !c.enabled) continue;
+
+                MonoBehaviour destr = TrollResourceMatcher.FindDestructible(c);
+                if (destr == null) continue;
+                if (destr.transform.IsChildOf(transform)) continue;
+                if (!TrollResourceMatcher.TargetMatches(destr, m_type)) continue;
+                if (!hitSet.Add(destr)) continue;
+
+                // для MineRock/MineRock5 точка должна попасть внутрь зоны
+                Vector3 p = (destr is MineRock || destr is MineRock5)
+                    ? c.bounds.center
+                    : SafeClosestPoint(c, point);
+                ApplyDamage(destr, p, dir);
+                applied++;
+            }
+        }
+
+        private static Vector3 SafeClosestPoint(Collider c, Vector3 to)
+        {
+            try
+            {
+                MeshCollider mc = c as MeshCollider;
+                if (mc != null && !mc.convex) return c.bounds.ClosestPoint(to);
+                return c.ClosestPoint(to);
+            }
+            catch { return c.bounds.ClosestPoint(to); }
+        }
+
+        // ============================================================
+        //  БЛЭКЛИСТ недостижимых/брошенных целей
+        // ============================================================
+        private void BlacklistPosition(Vector3 p)
+        {
+            if (IsBlacklisted(p)) return;
+            m_blackPos.Add(p);
+            m_blackTime.Add(Time.time);
+            if (m_blackPos.Count > 32) { m_blackPos.RemoveAt(0); m_blackTime.RemoveAt(0); }
+        }
+
+        private bool IsBlacklisted(Vector3 p)
+        {
+            for (int i = 0; i < m_blackPos.Count; i++)
+                if (Utils.DistanceSqr(m_blackPos[i], p) < BlacklistRadius * BlacklistRadius)
+                    return true;
+            return false;
+        }
+
+        private void CleanupBlacklist()
+        {
+            for (int i = m_blackPos.Count - 1; i >= 0; i--)
+                if (Time.time - m_blackTime[i] > BlacklistTime)
+                {
+                    m_blackPos.RemoveAt(i);
+                    m_blackTime.RemoveAt(i);
+                }
         }
 
         private void StopGather()
@@ -553,8 +779,16 @@ namespace TrollTamerMod
             Player.m_localPlayer?.Message(MessageHud.MessageType.TopLeft, msg, 0, null, false);
         }
 
+        private void ThrottledLog(string msg)
+        {
+            if (Time.time - m_lastLogTime < 5f) return;
+            m_lastLogTime = Time.time;
+            Debug.Log("[TrollMenu] " + msg);
+        }
+
         // ============================================================
-        //  ПУБЛИЧНОЕ API
+        //  ПУБЛИЧНОЕ API (сигнатуры сохранены — совместимость с
+        //  BuildOnToll FIX 21, MenuPatches, TrollFriend)
         // ============================================================
         public static void Start(ZNetView trollNview, GatherType type)
         {
@@ -594,10 +828,13 @@ namespace TrollTamerMod
             if (ctrl == null) ctrl = trollNview.gameObject.AddComponent<TrollGatherController>();
             ctrl.m_target = null;
             ctrl.m_targetCols = null;
-            ctrl.m_searchCooldown = 0;
+            ctrl.m_searchCooldown = 0f;
             ctrl.m_searchFailCount = 0;
             ctrl.m_abandonCount = 0;
             ctrl.m_lastSurfaceDist = float.MaxValue;
+            ctrl.m_faceTimer = 0f;
+            ctrl.m_noSurfaceTime = 0f;
+            ctrl.m_blackPos.Clear();
 
             string[] names = { "", "древесину", "качественную древесину", "цельную древесину", "камень", "медь" };
             Player.m_localPlayer?.Message(MessageHud.MessageType.Center,
@@ -1439,5 +1676,67 @@ namespace TrollTamerMod
                 __instance.gameObject.AddComponent<TrollGatherController>();
             }
         }
+    }
+
+    // ================================================================
+    //  ПАТЧИ ДОБЫЧИ v2: ванильный физический удар кулаков по ТЕКУЩЕЙ цели
+    //  добычи подавляется — урон авторитетен только от контроллера.
+    //  Зеркало схемы Companions.CombatPatches «SuppressHarvestPhysical»:
+    //  там ровно так же гасятся Destructible/MineRock/MineRock5/TreeBase/
+    //  TreeLog.Damage, если бьёт сборщик по своей цели, а урон идёт из
+    //  TryApplyTreeAoe/TryApplyRockAoe с флагом IsApplyingAoeDamage.
+    // ================================================================
+    [HarmonyPatch]
+    public static class TrollGatherDamagePatches
+    {
+        internal static bool ShouldSuppress(MonoBehaviour destructible, HitData hit)
+        {
+            if (TrollGatherController.IsApplyingDamage) return false; // урон контроллера — проходит
+            if (hit == null || destructible == null) return false;
+            Character attacker = hit.GetAttacker();
+            if (attacker == null) return false;
+            TrollGatherController ctrl = attacker.GetComponent<TrollGatherController>();
+            if (ctrl == null) return false;
+            return ctrl.IsAttackingTarget(destructible.gameObject);
+        }
+
+        [HarmonyPatch(typeof(Destructible), "Damage")]
+        [HarmonyPrefix]
+        private static bool Destructible_Damage_Prefix(Destructible __instance, HitData hit)
+            => !ShouldSuppress(__instance, hit);
+
+        [HarmonyPatch(typeof(MineRock), "Damage")]
+        [HarmonyPrefix]
+        private static bool MineRock_Damage_Prefix(MineRock __instance, HitData hit)
+            => !ShouldSuppress(__instance, hit);
+
+        [HarmonyPatch(typeof(MineRock5), "Damage")]
+        [HarmonyPrefix]
+        private static bool MineRock5_Damage_Prefix(MineRock5 __instance, HitData hit)
+            => !ShouldSuppress(__instance, hit);
+
+        [HarmonyPatch(typeof(TreeBase), "Damage")]
+        [HarmonyPrefix]
+        private static bool TreeBase_Damage_Prefix(TreeBase __instance, HitData hit)
+            => !ShouldSuppress(__instance, hit);
+    }
+
+    // TreeLog берём рефлексией (в остальном моде этот тип тоже не
+    // referenced напрямую — не привязываемся к нему и тут)
+    [HarmonyPatch]
+    public static class TrollGatherTreeLogDamagePatch
+    {
+        private static MethodBase TargetMethod()
+        {
+            MethodBase m = AccessTools.Method(AccessTools.TypeByName("TreeLog"), "Damage");
+            if (m != null) return m;
+            return AccessTools.Method(typeof(TrollGatherTreeLogDamagePatch), nameof(Stub));
+        }
+
+        private static void Stub() { }
+
+        [HarmonyPrefix]
+        private static bool Prefix(MonoBehaviour __instance, HitData hit)
+            => !TrollGatherDamagePatches.ShouldSuppress(__instance, hit);
     }
 }

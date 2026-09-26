@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <None Remove="icon\menu\forest.png" />
+    <None Remove="icon\menu\freeze.png" />
     <None Remove="icon\menu\map.png" />
     <None Remove="icon\menu\stone.png" />
     <None Remove="icon\menu\stone\copper.png" />
@@ -23,6 +24,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="icon\menu\forest.png" />
+    <EmbeddedResource Include="icon\menu\freeze.png" />
     <EmbeddedResource Include="icon\menu\map.png" />
     <EmbeddedResource Include="icon\menu\stone.png" />
     <EmbeddedResource Include="icon\menu\stone\copper.png" />
